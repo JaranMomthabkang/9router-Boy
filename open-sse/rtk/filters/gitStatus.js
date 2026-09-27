@@ -24,6 +24,9 @@ export function gitStatus(input) {
   let modified = 0;
   let untracked = 0;
   let conflicts = 0;
+  // Inside the long-form "Untracked files:" section, whose entries carry no
+  // marker at all — just a TAB and the path.
+  let inUntracked = false;
 
   for (const raw of lines) {
     if (!raw.trim()) continue;
@@ -34,6 +37,22 @@ export function gitStatus(input) {
 
     // Porcelain branch header: "## main...origin/main"
     if (raw.startsWith("##")) { branch = raw.replace(/^##\s*/, ""); continue; }
+
+    // Long-form section headers. Only "Untracked files:" is actionable: its
+    // entries are bare paths with no marker, so the branch below has to consume
+    // them or they are silently dropped. Any other header means the untracked
+    // section has ended.
+    if (/^[A-Z].*:$/.test(raw)) {
+      inUntracked = raw.startsWith("Untracked files:");
+      continue;
+    }
+
+    // A path line inside "Untracked files:" — TAB-indented, no status marker.
+    if (inUntracked && /^\t/.test(raw)) {
+      untracked++;
+      untrackedFiles.push(raw.trim());
+      continue;
+    }
 
     // Porcelain status (2 chars + space + path)
     if (raw.length >= 3 && /^[ MADRCU?!][ MADRCU?!] /.test(raw)) {
@@ -71,9 +90,6 @@ export function gitStatus(input) {
       else if (kind === "new file" || kind === "renamed") { staged++; stagedFiles.push(path); }
       continue;
     }
-
-    // "Untracked files:" section — gather bare paths after this marker
-    // Handled implicitly: plain paths without markers are skipped (safer).
   }
 
   let out = "";

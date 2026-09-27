@@ -241,6 +241,68 @@ describe("RTK filters", () => {
     expect(out.length).toBeLessThan(input.length);
   });
 
+  it("gitStatus reports long-form untracked files instead of dropping the section", () => {
+    // `git status` lists untracked entries as a TAB + bare path with no status
+    // marker, so they must be consumed while inside the "Untracked files:"
+    // section. They used to be skipped silently, which reported a dirty tree as
+    // "clean — nothing to commit" (and saved bytes by deleting the truth).
+    const out = gitStatus(makeGitStatus());
+    expect(out).toContain("? Untracked: 1 files");
+    expect(out).toContain("notes.txt");
+    expect(out).not.toContain("clean");
+  });
+
+  it("gitStatus counts every long-form untracked entry", () => {
+    const files = [
+      "apps/api/src/handlers/scratch-handler-experimental.js",
+      "apps/dashboard/src/components/ExperimentalNewWidget.jsx",
+      "coverage/lcov-report-index.html",
+      "dist/bundle-production.js.map",
+      "packages/shared/src/generated/schema.generated.d.ts",
+      "scripts/tmp-backfill-migration.sh",
+      "tmp/migration-dry-run-2026.log",
+    ];
+    const input = [
+      "On branch master",
+      "Untracked files:",
+      '  (use "git add <file>..." to include in what will be committed)',
+      ...files.map((f) => "\t" + f),
+      "",
+      'nothing added to commit but untracked files present (use "git add" to track)',
+    ].join("\n");
+    const out = gitStatus(input);
+    expect(out).toContain(`? Untracked: ${files.length} files`);
+    expect(out).toContain(files[0]);
+    expect(out).not.toContain("clean");
+  });
+
+  it("gitStatus keeps 'clean' only when the tree truly is clean", () => {
+    const input = [
+      "On branch main",
+      "Your branch is up to date with 'origin/main'.",
+      "",
+      "nothing to commit, working tree clean",
+    ].join("\n");
+    expect(gitStatus(input)).toContain("clean — nothing to commit");
+  });
+
+  it("gitStatus does not carry untracked state into a following section", () => {
+    const input = [
+      "On branch main",
+      "Untracked files:",
+      "\tscratch.txt",
+      "",
+      "Changes not staged for commit:",
+      "  (use \"git add <file>...\" to update what will be committed)",
+      "\tmodified:   real.js",
+    ].join("\n");
+    const out = gitStatus(input);
+    expect(out).toContain("? Untracked: 1 files");
+    expect(out).toContain("scratch.txt");
+    expect(out).toContain("~ Modified: 1 files");
+    expect(out).toContain("real.js");
+  });
+
   it("grep groups matches by file and caps per-file lines (Rust format)", () => {
     const input = makeGrepOutput();
     const out = grep(input);
