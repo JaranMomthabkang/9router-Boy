@@ -10,7 +10,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA temp_store = MEMORY;
 PRAGMA mmap_size = 30000000;
-PRAGMA cache_size = -64000;
+PRAGMA cache_size = -16000;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 `;

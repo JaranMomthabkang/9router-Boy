@@ -11,7 +11,7 @@ import {
   isTailscaleRunning, isTailscaleRunningStrict, isDaemonAlive, startFunnel,
   checkInternet,
   RESTART_COOLDOWN_MS, NETWORK_SETTLE_MS,
-  WATCHDOG_INTERVAL_MS, NETWORK_CHECK_INTERVAL_MS, VIRTUAL_IFACE_REGEX,
+  WATCHDOG_INTERVAL_MS, NETWORK_CHECK_INTERVAL_MS, SLEEP_DETECT_MS, VIRTUAL_IFACE_REGEX,
 } from "@/lib/tunnel";
 import { getMitmStatus, startMitm, loadEncryptedPassword, initDbHooks, restoreToolDNS, removeAllDNSEntriesSync } from "@/mitm/manager";
 import { syncToJson as syncMitmAliasCache } from "@/lib/mitmAliasCache";
@@ -285,7 +285,7 @@ function startNetworkMonitor() {
 
       const currentFingerprint = getNetworkFingerprint();
       const networkChanged = currentFingerprint !== g.lastNetworkFingerprint;
-      const wasSleep = elapsed > NETWORK_CHECK_INTERVAL_MS * 6;
+      const wasSleep = elapsed > SLEEP_DETECT_MS;
       if (networkChanged) g.lastNetworkFingerprint = currentFingerprint;
 
       // Real reachability check (TCP 1.1.1.1:443) — not just interface presence

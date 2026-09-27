@@ -180,3 +180,13 @@ export function shouldDefaultClaudeToolType(provider, finalFormat, tools, PROVID
   );
 }
 
+// Merge a streamed tool-name fragment into the name accumulated so far.
+export function accumulateToolName(prev, frag) {
+  if (!frag) return prev || "";
+  if (!prev) return frag;
+  if (frag === prev) return prev;                 // full re-echo
+  if (frag.startsWith(prev)) return frag;         // growing snapshot ("Re" → "Read")
+  if (prev.startsWith(frag)) return prev;         // shorter re-echo of an already-complete name
+  return prev + frag;                             // genuine split ("Re" + "ad")
+}
+

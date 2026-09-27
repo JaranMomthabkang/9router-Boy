@@ -5,7 +5,7 @@ import { RISK_NOTICE } from "@/shared/constants/providersDisplay";
 const MEDIA_ENTRY_KEYS = [
   "serviceKinds", "ttsConfig", "sttConfig", "embeddingConfig",
   "imageConfig", "imageToTextConfig", "videoConfig", "musicConfig",
-  "searchViaChat", "searchConfig", "fetchConfig", "credentialFallback",
+  "searchViaChat", "searchConfig", "fetchConfig", "credentialFallback", "systemoneConfig",
   "modelsFetcher", "mediaPriority", "hiddenKinds",
 ];
 
@@ -79,6 +79,7 @@ export const MEDIA_PROVIDER_KINDS = [
   { id: "webFetch",    label: "Web Fetch",      icon: "language",          endpoint: { method: "POST", path: "/v1/web/fetch" } },
   { id: "video",       label: "Video",          icon: "movie",             endpoint: { method: "POST", path: "/v1/videos/generations" } },
   { id: "music",       label: "Music",          icon: "music_note",        endpoint: { method: "POST", path: "/v1/audio/music" } },
+  { id: "systemone",   label: "System One",     icon: "psychology",        endpoint: { method: "POST", path: "/v1/systemone" }, isNew: true },
 ];
 
 export const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
@@ -163,3 +164,52 @@ export const USAGE_SUPPORTED_PROVIDERS = REGISTRY
 export const USAGE_APIKEY_PROVIDERS = REGISTRY
   .filter(r => r.features?.usageApikey)
   .map(r => r.id);
+// Helper: can this provider's upstream list LLM models (i.e. is the "Sync Models"
+// feature meaningful)? False for media/search/embedding providers (serviceKinds without
+// "llm") and web-cookie providers (session auth, no models API). openai/anthropic
+// compatible providers always expose a /models endpoint.
+export function providerSupportsModelSync(providerId) {
+  if (!providerId) return false;
+  if (isCustomEmbeddingProvider(providerId)) return false;
+  if (isOpenAICompatibleProvider(providerId) || isAnthropicCompatibleProvider(providerId)) return true;
+  if (WEB_COOKIE_PROVIDERS[providerId]) return false;
+  const provider = AI_PROVIDERS[providerId];
+  if (!provider) return false;
+  if (provider.authType === "cookie") return false;
+  const kinds = provider.serviceKinds ?? ["llm"];
+  return kinds.includes("llm");
+}
+
+// Providers that support public model listing without requiring an active connection in DB
+export function isPublicModelsProvider(providerId) {
+  if (!providerId) return false;
+  const pId = String(providerId).toLowerCase();
+  const publicGateways = new Set([
+    "opencode",
+    "opencode-zen",
+    "oc",
+    "opencode-go",
+    "ocg",
+    "openrouter",
+    "nousresearch",
+    "nous",
+    "nous-portal",
+    "agentrouter",
+    "api-airforce",
+    "cheaperinference",
+    "freebuff",
+    "zenmux-free",
+    "felo-web",
+    "aipass",
+    "aipass-th",
+    "aipass-bridge",
+    "ap",
+    "nara",
+    "nararouter",
+    "bynara",
+    "by-nara",
+  ]);
+  if (publicGateways.has(pId)) return true;
+  const provider = AI_PROVIDERS[pId];
+  return !!(provider?.noAuth && provider?.hasFree);
+}
