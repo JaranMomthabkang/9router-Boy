@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isPublicModelsProvider } from "@/shared/constants/providers";
-import { GEMINI_CONFIG, ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
+import { GEMINI_CONFIG, ANTIGRAVITY_CONFIG, ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
 import { refreshGoogleToken, refreshCodexToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { getModelsByProviderId } from "open-sse/config/providerModels.js";
@@ -94,14 +94,19 @@ const getStaticProviderModels = (providerId) =>
 // Enrich models with lastSyncedAt / firstSeenAt from the syncedModels kv.
 // Only stamps when models.length > 0 (empty list is a static-fallback signal).
 export async function buildModelsResponse({ provider, connectionId, models, warning }) {
-  const rawModels = Array.isArray(models) ? models.filter((m) => m && m.id) : [];
+  const rawModels = Array.isArray(models) ? models.filter((m) => m && (m.id || m.name || m.model)) : [];
   // Dedup by model ID (upstream may return duplicates)
   const seen = new Set();
   const safeModels = [];
   for (const m of rawModels) {
-    if (seen.has(m.id)) continue;
-    seen.add(m.id);
-    safeModels.push(m);
+    const id = m.id || m.name || m.model;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    safeModels.push({
+      ...m,
+      id,
+      name: m.name || m.displayName || m.display_name || id,
+    });
   }
   let stampMap = {};
   if (safeModels.length > 0 && connectionId) {
@@ -286,15 +291,6 @@ const PROVIDER_MODELS_CONFIG = {
       errorLabel: "Failed to fetch Codex models"
     })
   },
-  antigravity: {
-    url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:models",
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    authHeader: "Authorization",
-    authPrefix: "Bearer ",
-    body: {},
-    parseResponse: (data) => data.models || []
-  },
   github: {
     url: "https://api.githubcopilot.com/models",
     method: "GET",
@@ -375,8 +371,41 @@ const PROVIDER_MODELS_CONFIG = {
   cohere: createOpenAIModelsConfig("https://api.cohere.ai/v1/models"),
   nebius: createOpenAIModelsConfig("https://api.studio.nebius.ai/v1/models"),
   siliconflow: createOpenAIModelsConfig("https://api.siliconflow.com/v1/models"),
-  hyperbolic: createOpenAIModelsConfig("https://api.hyperbolic.xyz/v1/models"),
-  ollama: createOpenAIModelsConfig("https://ollama.com/api/tags"),
+  ollama: {
+    customResolver: async (connection) => {
+      const token = connection.apiKey || connection.accessToken;
+      if (!token) {
+        const staticModels = PROVIDERS.ollama?.models || [];
+        return {
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+          warning: "No API key configured for Ollama Cloud; showing known models catalog.",
+        };
+      }
+      try {
+        const { OllamaService } = await import("@/lib/oauth/services/ollama.js");
+        const svc = new OllamaService();
+        const liveModels = await svc.listAvailableModels(token);
+        const staticModels = PROVIDERS.ollama?.models || [];
+        const seen = new Set((liveModels || []).map((m) => m.id));
+        const merged = [...(liveModels || [])];
+        for (const sm of staticModels) {
+          const id = typeof sm === "string" ? sm : sm.id;
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            merged.push(typeof sm === "string" ? { id: sm, name: sm } : { ...sm, id: sm.id, name: sm.name || sm.id });
+          }
+        }
+        return { models: merged };
+      } catch (error) {
+        console.log("Failed to fetch Ollama Cloud models dynamically:", error?.message);
+        const staticModels = PROVIDERS.ollama?.models || [];
+        return {
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+          warning: `Live sync notice: ${error?.message || "Failed to query Ollama API"}. Showing known models catalog.`,
+        };
+      }
+    }
+  },
   // ollama-local: url resolved dynamically below via providerSpecificData.baseUrl
   nanobanana: createOpenAIModelsConfig("https://api.nanobananaapi.ai/v1/models"),
   chutes: createOpenAIModelsConfig("https://llm.chutes.ai/v1/models"),
@@ -651,21 +680,45 @@ export async function GET(request, { params }) {
       if (!baseUrl) {
         return NextResponse.json({ error: "No base URL configured for OpenAI compatible provider" }, { status: 400 });
       }
-      const url = `${baseUrl.replace(/\/$/, "")}/models`;
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${connection.apiKey}`,
-        },
-      });
+      let cleanBase = baseUrl.trim().replace(/\/$/, "");
+      cleanBase = cleanBase.replace(/\/chat\/completions$/, "").replace(/\/completions$/, "");
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
+      const candidateUrls = [
+        `${cleanBase}/models`,
+      ];
+      if (!cleanBase.endsWith("/v1")) {
+        candidateUrls.push(`${cleanBase}/v1/models`);
+      } else {
+        candidateUrls.push(`${cleanBase.slice(0, -3)}/models`);
+      }
+
+      let response = null;
+      let errorText = "";
+      for (const url of candidateUrls) {
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${connection.apiKey}`,
+            },
+          });
+          if (res.ok) {
+            response = res;
+            break;
+          }
+          errorText = await res.text();
+          response = res;
+        } catch (e) {
+          errorText = e.message;
+        }
+      }
+
+      if (!response || !response.ok) {
+        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response?.status || 500, errorText));
         return NextResponse.json(
-          { error: formatModelsFetchError(response.status, errorText) },
-          { status: response.status }
+          { error: formatModelsFetchError(response?.status || 500, errorText) },
+          { status: response?.status || 500 }
         );
       }
 
@@ -685,28 +738,47 @@ export async function GET(request, { params }) {
         return NextResponse.json({ error: "No base URL configured for Anthropic compatible provider" }, { status: 400 });
       }
 
-      baseUrl = baseUrl.replace(/\/$/, "");
-      if (baseUrl.endsWith("/messages")) {
-        baseUrl = baseUrl.slice(0, -9);
+      let cleanBase = baseUrl.trim().replace(/\/$/, "");
+      if (cleanBase.endsWith("/messages")) {
+        cleanBase = cleanBase.slice(0, -9);
       }
 
-      const url = `${baseUrl}/models`;
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": connection.apiKey,
-          "anthropic-version": "2023-06-01",
-          "Authorization": `Bearer ${connection.apiKey}`
-        },
-      });
+      const candidateUrls = [
+        `${cleanBase}/models`,
+      ];
+      if (!cleanBase.endsWith("/v1")) {
+        candidateUrls.push(`${cleanBase}/v1/models`);
+      }
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
+      let response = null;
+      let errorText = "";
+      for (const url of candidateUrls) {
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": connection.apiKey,
+              "anthropic-version": "2023-06-01",
+              "Authorization": `Bearer ${connection.apiKey}`
+            },
+          });
+          if (res.ok) {
+            response = res;
+            break;
+          }
+          errorText = await res.text();
+          response = res;
+        } catch (e) {
+          errorText = e.message;
+        }
+      }
+
+      if (!response || !response.ok) {
+        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response?.status || 500, errorText));
         return NextResponse.json(
-          { error: formatModelsFetchError(response.status, errorText) },
-          { status: response.status }
+          { error: formatModelsFetchError(response?.status || 500, errorText) },
+          { status: response?.status || 500 }
         );
       }
 
@@ -717,6 +789,122 @@ export async function GET(request, { params }) {
         provider: connection.provider,
         connectionId: connection.id,
         models
+      });
+    }
+
+    if (connection.provider === "gemini-cli" || connection.provider === "antigravity") {
+      const { accessToken, refreshToken } = connection;
+      if (!accessToken) {
+        return NextResponse.json({ error: "No valid token found" }, { status: 401 });
+      }
+
+      const projectId = connection.projectId || connection.providerSpecificData?.projectId;
+      const body = projectId ? { project: projectId } : {};
+
+      const userAgent = connection.provider === "antigravity"
+        ? "antigravity/1.107.0 darwin/arm64"
+        : "google-api-nodejs-client/9.15.1";
+      const clientId = connection.provider === "antigravity"
+        ? ANTIGRAVITY_CONFIG.clientId
+        : GEMINI_CONFIG.clientId;
+      const clientSecret = connection.provider === "antigravity"
+        ? ANTIGRAVITY_CONFIG.clientSecret
+        : GEMINI_CONFIG.clientSecret;
+
+      const fetchModels = async (token) => {
+        const headers = {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+          "User-Agent": userAgent,
+          ...(connection.provider === "antigravity" && {
+            "X-Client-Name": "antigravity",
+            "X-Client-Version": "2.1.1",
+          }),
+        };
+        const urls = connection.provider === "antigravity"
+          ? [
+              "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+              GEMINI_CLI_MODELS_URL,
+            ]
+          : [GEMINI_CLI_MODELS_URL];
+
+        for (const url of urls) {
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(body),
+            });
+            if (res.ok || res.status === 401) return res;
+          } catch {
+            // try next url
+          }
+        }
+        return fetch(urls[0], { method: "POST", headers, body: JSON.stringify(body) });
+      };
+
+      let warning;
+
+      try {
+        let response = await fetchModels(accessToken);
+
+        // Attempt refresh on 401 when refresh token exists
+        if (!response.ok && response.status === 401 && refreshToken) {
+          const refreshed = await refreshGoogleToken(refreshToken, clientId, clientSecret);
+          if (refreshed?.accessToken) {
+            await updateProviderCredentials(connection.id, {
+              accessToken: refreshed.accessToken,
+              refreshToken: refreshed.refreshToken,
+              expiresIn: refreshed.expiresIn,
+            });
+            response = await fetchModels(refreshed.accessToken);
+          }
+        }
+
+        if (response.ok) {
+          const data = await response.json();
+          let models = parseGeminiCliModels(data);
+
+          if (connection.provider === "antigravity" && PROVIDERS.antigravity?.models) {
+            const seen = new Set(models.map((m) => m.id));
+            for (const staticModel of PROVIDERS.antigravity.models) {
+              if (/gemini-3/i.test(staticModel.id) && !seen.has(staticModel.id)) {
+                seen.add(staticModel.id);
+                models.push({
+                  ...staticModel,
+                  id: staticModel.id,
+                  name: staticModel.name || staticModel.id,
+                });
+              }
+            }
+          }
+
+          if (models.length > 0) {
+            return buildModelsResponse({
+              provider: connection.provider,
+              connectionId: connection.id,
+              models
+            });
+          }
+        } else {
+          const errorText = await response.text();
+          warning = formatModelsFetchError(response.status, errorText).replace(
+            /^[0-9]+ — /,
+            ""
+          );
+          console.log(`Failed to fetch ${connection.provider} models dynamically, falling back to static:`, safeLogDetail(response.status, errorText));
+        }
+      } catch (error) {
+        warning = error.message;
+        console.log(`Failed to fetch ${connection.provider} models dynamically, falling back to static:`, error);
+      }
+
+      const staticModels = PROVIDERS[connection.provider]?.models || [];
+      return buildModelsResponse({
+        provider: connection.provider,
+        connectionId: connection.id,
+        models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        warning: warning ? `Live sync warning: ${warning}. Showing static model list.` : undefined,
       });
     }
 
@@ -744,18 +932,15 @@ export async function GET(request, { params }) {
     }
 
     if (!config) {
-      const staticModels = pDef?.models || [];
-      if (staticModels.length > 0) {
-        return buildModelsResponse({
-          provider: connection.provider,
-          connectionId: connection.id,
-          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
-        });
-      }
-      return NextResponse.json(
-        { error: `Provider ${connection.provider} does not support models listing` },
-        { status: 400 }
-      );
+      const staticModels = pDef?.models || getModelsByProviderId(connection.provider) || [];
+      return buildModelsResponse({
+        provider: connection.provider,
+        connectionId: connection.id,
+        models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        warning: staticModels.length > 0
+          ? "Showing catalog models for this provider."
+          : "No known models found for this provider.",
+      });
     }
 
     // Config-driven custom resolver path (OAuth refresh, non-OpenAI shape, etc.)
@@ -854,12 +1039,12 @@ export async function GET(request, { params }) {
       const errorText = await response.text();
       console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
       const staticModels = pDef?.models || [];
-      const isPublic = connection.id?.startsWith("public:") || isPublicModelsProvider(connection.provider);
-      if (staticModels.length > 0 && isPublic) {
+      if (staticModels.length > 0) {
         return buildModelsResponse({
           provider: connection.provider,
           connectionId: connection.id,
           models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+          warning: `Upstream error (${response.status}): showing known provider models.`,
         });
       }
       return NextResponse.json(

@@ -164,23 +164,9 @@ export const USAGE_SUPPORTED_PROVIDERS = REGISTRY
 export const USAGE_APIKEY_PROVIDERS = REGISTRY
   .filter(r => r.features?.usageApikey)
   .map(r => r.id);
-
-export const WEB_COOKIE_PROVIDERS = {
-  "grok-web": true,
-  "perplexity-web": true,
-};
-
-// Helper: can this provider's upstream list LLM models (i.e. is the "Sync Models"
-// feature meaningful)? False for media/search/embedding providers (serviceKinds without
-// "llm") and web-cookie providers (session auth, no models API). openai/anthropic
-// compatible providers always expose a /models endpoint.
+// Helper: supports model syncing for all providers
 export function providerSupportsModelSync(providerId) {
-  if (isOpenAICompatibleProvider(providerId) || isAnthropicCompatibleProvider(providerId)) return true;
-  if (WEB_COOKIE_PROVIDERS[providerId]) return false;
-  const provider = AI_PROVIDERS[providerId];
-  if (!provider) return false;
-  const kinds = provider.serviceKinds ?? ["llm"];
-  return kinds.includes("llm");
+  return Boolean(providerId);
 }
 
 // Providers that support public model listing without requiring an active connection in DB

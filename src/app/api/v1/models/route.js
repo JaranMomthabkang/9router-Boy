@@ -139,6 +139,19 @@ const LIVE_MODEL_RESOLVERS = {
         })),
     };
   },
+  ollama: async (conn) => {
+    const apiKey = conn?.apiKey || conn?.accessToken;
+    if (!apiKey) return null;
+    try {
+      const { OllamaService } = await import("@/lib/oauth/services/ollama.js");
+      const svc = new OllamaService();
+      const list = await svc.listAvailableModels(apiKey);
+      const models = (list || []).map((m) => ({ id: m.id, name: m.name || m.id }));
+      return models.length ? { models } : null;
+    } catch {
+      return null;
+    }
+  },
 };
 
 const parseOpenAIStyleModels = (data) => {

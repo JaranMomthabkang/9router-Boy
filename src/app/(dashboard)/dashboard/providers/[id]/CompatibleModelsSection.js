@@ -71,7 +71,7 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
   );
 }
 
-export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic }) {
+export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic, onOpenSyncModal }) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -182,8 +182,13 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
         <Button size="sm" icon="add" onClick={handleAdd} disabled={!newModel.trim() || adding}>
           {adding ? "Adding..." : "Add"}
         </Button>
+        {onOpenSyncModal && (
+          <Button size="sm" variant="secondary" icon="sync" onClick={onOpenSyncModal} disabled={!canImport}>
+            Sync Models
+          </Button>
+        )}
         <Button size="sm" variant="secondary" icon="download" onClick={handleImport} disabled={!canImport || importing}>
-          {importing ? "Importing..." : "Import from /models"}
+          {importing ? "Importing..." : "Quick Import All"}
         </Button>
       </div>
 
@@ -229,4 +234,5 @@ CompatibleModelsSection.propTypes = {
     isActive: PropTypes.bool,
   })).isRequired,
   isAnthropic: PropTypes.bool,
+  onOpenSyncModal: PropTypes.func,
 };

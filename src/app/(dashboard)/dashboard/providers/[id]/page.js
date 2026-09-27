@@ -166,9 +166,8 @@ export default function ProviderDetailPage() {
   const isAnthropicCompatible = isAnthropicCompatibleProvider(providerId);
   const isCompatible = isOpenAICompatible || isAnthropicCompatible;
   const hasDualAuthModes = !isCompatible && isOAuth && supportsApiKeyAuth;
-  const canSyncModels = connections.some((conn) => conn.isActive !== false) || isPublicModelsProvider(providerId);
-  const providerDisplayAlias = providerNode?.prefix || providerAlias;
-  const providerStorageAlias = providerNode?.prefix || providerAlias;
+  const canSyncModels = connections.some((conn) => conn.isActive !== false) || isPublicModelsProvider(providerId) || isFreeNoAuth;
+  const providerStorageAlias = providerNode?.prefix || (isCompatible ? providerId : providerAlias);
   const oauthConnectionLabel =
     providerId === "xai" ? "Grok Build OAuth"
     : providerId === "grok-cli" ? "Grok CLI Device Login"
@@ -185,7 +184,6 @@ export default function ProviderDetailPage() {
     const levels = getThinkingLevels(providerId, modelId);
     return levels && levels.includes(thinkingMode) ? thinkingMode : null;
   };
-  const providerStorageAlias = isCompatible ? providerId : providerAlias;
   // Union of levels across this provider's reasoning models — drives the level picker options.
   // Include custom models too (e.g. manually added gpt-5.6-sol → max).
   const providerThinkingLevels = (() => {
@@ -727,22 +725,20 @@ export default function ProviderDetailPage() {
       usedAliases.add(alias);
       usedModels.add(fullModel);
       const cw = Number(item.contextLength);
-      if (Number.isFinite(cw) && cw > 0) {
-        try {
-          await fetch("/api/models/custom", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              providerAlias: providerStorageAlias,
-              id: item.id,
-              type: "llm",
-              source: "synced",
-              contextLength: cw,
-            }),
-          });
-        } catch {
-          // fail-open
-        }
+      try {
+        await fetch("/api/models/custom", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            providerAlias: providerStorageAlias,
+            id: item.id,
+            type: "llm",
+            source: "synced",
+            contextLength: Number.isFinite(cw) && cw > 0 ? cw : undefined,
+          }),
+        });
+      } catch {
+        // fail-open
       }
     }
     await Promise.all([fetchAliases(), fetchCustomModels()]);
@@ -1227,6 +1223,7 @@ export default function ProviderDetailPage() {
           onDeleteCustomModel={(modelId) => handleDeleteCustomModel(modelId, "llm", providerStorageAlias)}
           connections={connections}
           isAnthropic={isAnthropicCompatible}
+          onOpenSyncModal={() => setShowSyncModels(true)}
         />
       );
     }
@@ -2042,24 +2039,23 @@ export default function ProviderDetailPage() {
         variant="danger"
       />
 
-      {!isCompatible && (
-        <SyncProviderModelsModal
-          isOpen={showSyncModels}
-          connections={connections}
-          existingModelIds={[
-            ...models.map((model) => model.id),
-            ...kiloFreeModels.map((model) => model.id),
-            ...Object.values(modelAliases)
-              .filter((fullModel) => fullModel.startsWith(`${providerStorageAlias}/`))
-              .map((fullModel) => fullModel.slice(`${providerStorageAlias}/`.length)),
-          ]}
-          providerDisplayAlias={providerDisplayAlias}
-          passthroughModels={!!providerInfo.passthroughModels}
-          providerId={providerId}
-          onAddModels={handleAddSyncedModels}
-          onClose={() => setShowSyncModels(false)}
-        />
-      )}
+      <SyncProviderModelsModal
+        isOpen={showSyncModels}
+        connections={connections}
+        existingModelIds={[
+          ...models.map((model) => model.id),
+          ...kiloFreeModels.map((model) => model.id),
+          ...customModels.filter((entry) => entry.providerAlias === providerStorageAlias).map((entry) => entry.id),
+          ...Object.values(modelAliases)
+            .filter((fullModel) => fullModel.startsWith(`${providerStorageAlias}/`))
+            .map((fullModel) => fullModel.slice(`${providerStorageAlias}/`.length)),
+        ]}
+        providerDisplayAlias={providerDisplayAlias}
+        passthroughModels={!!providerInfo.passthroughModels}
+        providerId={providerId}
+        onAddModels={handleAddSyncedModels}
+        onClose={() => setShowSyncModels(false)}
+      />
     </div>
   );
 }
