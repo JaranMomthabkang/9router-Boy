@@ -45,8 +45,14 @@ export function autoDetectFilter(text) {
   const first5 = nonEmpty.slice(0, 5);
   if (first5.some(isGrepLine)) return grep;
 
-  // Rust find rule: ALL non-empty lines path-like (no ':'), >=3 lines
-  if (nonEmpty.length >= 3 && nonEmpty.every(isPathLike)) return find;
+  // Rust find rule: ALL non-empty lines path-like (no ':'), >=3 lines.
+  // `find <dir>` also emits its own root as a bare name ("open-sse" alongside
+  // "open-sse/rtk/index.js"), which is not slash-bearing and used to disqualify
+  // the whole dump. Accept bare tokens too, but only when the dump actually shows
+  // a path hierarchy (>=3 slash-bearing lines) — otherwise prose like
+  // "line1\nline2\nline3" would classify as `find`.
+  if (nonEmpty.length >= 3 && nonEmpty.every(isPathLikeOrBareName)
+    && nonEmpty.filter(isPathLike).length >= 3) return find;
 
   // Tree: contains box-drawing glyphs typical of `tree` command
   if (RE_TREE_GLYPH.test(head)) return tree;
@@ -57,8 +63,11 @@ export function autoDetectFilter(text) {
   // Cursor Glob search list header
   if (SEARCH_LIST_HEADER_RE.test(head)) return searchList;
 
-  // Line-numbered file dump ("  N|content") — fire only if many lines match
-  if (lines.length >= SMART_TRUNCATE_MIN_LINES && isLineNumbered(lines)) {
+  // Line-numbered file dump ("  N|content" / "  N\tcontent") — fire only if many lines
+  // match. Gate on the FULL text, not `lines`: those come from the 1KB detect window
+  // (<=~12 lines) and could never reach a 250-line threshold, which made this dead code.
+  const allLines = text.split("\n");
+  if (allLines.length >= SMART_TRUNCATE_MIN_LINES && isLineNumbered(allLines)) {
     return readNumbered;
   }
 
@@ -91,6 +100,19 @@ function isPathLike(line) {
   if (/^[A-Za-z]:[\\/]/.test(t)) return true;
   if (t.includes(":")) return false;
   return t.startsWith(".") || t.startsWith("/") || t.includes("/");
+}
+
+// A bare filename/dirname: no whitespace, no colon, no glob/prompt noise.
+// `find <dir>` lists the search root this way, mixed in with real paths.
+function isBareName(line) {
+  const t = line.trim();
+  if (t.length === 0 || t.includes(":")) return false;
+  if (/[\s*?<>{}$|;&"']/.test(t)) return false;
+  return true;
+}
+
+function isPathLikeOrBareName(line) {
+  return isPathLike(line) || isBareName(line);
 }
 
 function isMostlyPorcelain(head) {

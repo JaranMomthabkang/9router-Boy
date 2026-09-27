@@ -297,6 +297,32 @@ describe("autoDetectFilter", () => {
     const txt = "line1\nline2\nline3\nline4\nline5\nline6\n";
     expect(autoDetectFilter(txt).filterName).toBe("dedup-log");
   });
+  it("detects `find <dir>` output that lists its own bare root", () => {
+    // `find open-sse -maxdepth N` prints the root as a bare name alongside real
+    // paths; the root has no slash and used to disqualify the whole dump.
+    const input = [
+      "open-sse",
+      "open-sse/config",
+      "open-sse/handlers",
+      "open-sse/rtk/index.js",
+      "open-sse/rtk/filters/ls.js"
+    ].join("\n");
+    expect(autoDetectFilter(input).filterName).toBe("find");
+  });
+  it("does not classify multi-line prose as `find`", () => {
+    expect(autoDetectFilter("alpha beta\ngamma delta\nepsilon zeta\neta theta\niota kappa").filterName)
+      .toBe("dedup-log");
+  });
+  it("detects line-numbered dumps with both separators", () => {
+    const tabbed = Array.from({ length: 300 }, (_, i) => `     ${i + 1}\timport x${i}`).join("\n");
+    expect(autoDetectFilter(tabbed).filterName).toBe("read-numbered");
+    const piped = Array.from({ length: 300 }, (_, i) => `  ${i + 1}|content ${i}`).join("\n");
+    expect(autoDetectFilter(piped).filterName).toBe("read-numbered");
+  });
+  it("leaves short line-numbered files alone (below the 250-line gate)", () => {
+    const short = Array.from({ length: 40 }, (_, i) => `  ${i + 1}|content ${i}`).join("\n");
+    expect(autoDetectFilter(short).filterName).not.toBe("read-numbered");
+  });
 });
 
 describe("RTK filters (extras)", () => {
