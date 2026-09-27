@@ -330,6 +330,24 @@ const PROVIDER_MODELS_CONFIG = {
     authHeader: "x-api-key",
     parseResponse: (data) => data.data || []
   },
+  agentrouter: {
+    url: "https://agentrouter.org/v1/models",
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "Claude-Code/0.2.29",
+      "anthropic-version": "2023-06-01",
+    },
+    authHeader: "x-api-key",
+    parseResponse: (data) => (Array.isArray(data) ? data : data?.data || data?.models || []),
+  },
+  opencode: createOpenAIModelsConfig("https://opencode.ai/zen/v1/models"),
+  "opencode-zen": createOpenAIModelsConfig("https://opencode.ai/zen/v1/models"),
+  "opencode-go": createOpenAIModelsConfig("https://opencode.ai/zen/go/v1/models"),
+  minimax: createOpenAIModelsConfig("https://api.minimax.io/v1/models"),
+  "minimax-cn": createOpenAIModelsConfig("https://api.minimaxi.com/v1/models"),
+  blackbox: createOpenAIModelsConfig("https://api.blackbox.ai/v1/models"),
+  kimi: createOpenAIModelsConfig("https://api.kimi.com/coding/v1/models"),
 
   alicode: {
     url: "https://coding.dashscope.aliyuncs.com/v1/models",
@@ -671,6 +689,15 @@ export async function GET(request, { params }) {
           isActive: true,
         };
       } else {
+        const staticModels = getModelsByProviderId(id);
+        if (staticModels && staticModels.length > 0) {
+          return buildModelsResponse({
+            provider: id,
+            connectionId: `catalog:${id}`,
+            models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+            warning: "No active connection configured. Showing known models catalog.",
+          });
+        }
         return NextResponse.json({ error: "Connection not found" }, { status: 404 });
       }
     }
@@ -716,6 +743,15 @@ export async function GET(request, { params }) {
 
       if (!response || !response.ok) {
         console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response?.status || 500, errorText));
+        const staticModels = getModelsByProviderId(connection.provider) || [];
+        if (staticModels.length > 0) {
+          return buildModelsResponse({
+            provider: connection.provider,
+            connectionId: connection.id,
+            models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+            warning: `${formatModelsFetchError(response?.status || 500, errorText).replace(/^[0-9]+ — /, "")}. Showing custom catalog.`,
+          });
+        }
         return NextResponse.json(
           { error: formatModelsFetchError(response?.status || 500, errorText) },
           { status: response?.status || 500 }
@@ -776,6 +812,15 @@ export async function GET(request, { params }) {
 
       if (!response || !response.ok) {
         console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response?.status || 500, errorText));
+        const staticModels = getModelsByProviderId(connection.provider) || [];
+        if (staticModels.length > 0) {
+          return buildModelsResponse({
+            provider: connection.provider,
+            connectionId: connection.id,
+            models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+            warning: `${formatModelsFetchError(response?.status || 500, errorText).replace(/^[0-9]+ — /, "")}. Showing custom catalog.`,
+          });
+        }
         return NextResponse.json(
           { error: formatModelsFetchError(response?.status || 500, errorText) },
           { status: response?.status || 500 }
@@ -789,6 +834,56 @@ export async function GET(request, { params }) {
         provider: connection.provider,
         connectionId: connection.id,
         models
+      });
+    }
+
+    // Nara: Upstream /v1/models returns 500 / 403 on user keys.
+    // Return curated static seed catalog directly.
+    if (["nara", "nararouter", "bynara", "by-nara"].includes(connection.provider)) {
+      const staticModels = PROVIDERS["nara"]?.models || getModelsByProviderId("nara") || [];
+      return buildModelsResponse({
+        provider: connection.provider,
+        connectionId: connection.id,
+        models: staticModels
+          .map((m) => {
+            if (typeof m === "string") return { id: m, name: m };
+            const id = m?.id || m?.name;
+            if (!id) return null;
+            return {
+              ...m,
+              id,
+              name: m.name || id,
+            };
+          })
+          .filter(Boolean),
+        warning: "Nara upstream does not expose dynamic model enumeration; loaded standard catalog.",
+      });
+    }
+
+    // AiPASS TH: Fetch live models or return static seed catalog
+    if (["aipass", "aipass-th", "aipass-bridge", "ap"].includes(connection.provider)) {
+      let liveModels = [];
+      try {
+        const aipassBridge = await import("open-sse/services/aipassBridge.js").catch(() => null);
+        if (aipassBridge?.listAipassModels) {
+          liveModels = await aipassBridge.listAipassModels();
+        }
+      } catch (err) {
+        // ignore bridge error
+      }
+      if (liveModels && liveModels.length > 0) {
+        return buildModelsResponse({
+          provider: connection.provider,
+          connectionId: connection.id,
+          models: liveModels,
+        });
+      }
+      const staticModels = PROVIDERS["aipass"]?.models || getModelsByProviderId(connection.provider) || [];
+      return buildModelsResponse({
+        provider: connection.provider,
+        connectionId: connection.id,
+        models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        warning: "Loaded AiPASS catalog models.",
       });
     }
 
@@ -960,6 +1055,15 @@ export async function GET(request, { params }) {
     // Get auth token
     let token = connection.providerSpecificData?.copilotToken || connection.accessToken || connection.apiKey;
     if (!token && !isPublicModelsProvider(connection.provider)) {
+      const staticModels = pDef?.models || getModelsByProviderId(connection.provider) || [];
+      if (staticModels.length > 0) {
+        return buildModelsResponse({
+          provider: connection.provider,
+          connectionId: connection.id,
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+          warning: "No API key configured for this connection. Showing known models catalog.",
+        });
+      }
       return NextResponse.json({ error: "No valid token found" }, { status: 401 });
     }
 
@@ -997,12 +1101,13 @@ export async function GET(request, { params }) {
       response = await fetch(url, fetchOptions);
     } catch (networkErr) {
       console.log(`Network error fetching models from ${connection.provider}:`, networkErr?.message);
-      const staticModels = pDef?.models || [];
+      const staticModels = pDef?.models || getModelsByProviderId(connection.provider) || [];
       if (staticModels.length > 0) {
         return buildModelsResponse({
           provider: connection.provider,
           connectionId: connection.id,
           models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+          warning: `Upstream unreachable (${networkErr?.message || "network error"}). Showing known models catalog.`,
         });
       }
       throw networkErr;
@@ -1038,13 +1143,13 @@ export async function GET(request, { params }) {
     if (!response.ok) {
       const errorText = await response.text();
       console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
-      const staticModels = pDef?.models || [];
+      const staticModels = pDef?.models || getModelsByProviderId(connection.provider) || [];
       if (staticModels.length > 0) {
         return buildModelsResponse({
           provider: connection.provider,
           connectionId: connection.id,
           models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
-          warning: `Upstream error (${response.status}): showing known provider models.`,
+          warning: `${formatModelsFetchError(response.status, errorText).replace(/^[0-9]+ — /, "")}. Showing known models catalog.`,
         });
       }
       return NextResponse.json(
@@ -1055,7 +1160,10 @@ export async function GET(request, { params }) {
 
     const data = await response.json();
     const parsed = config.parseResponse(data);
-    let models = (Array.isArray(parsed) && parsed.length > 0) ? [...parsed] : (pDef?.models ? [...pDef.models] : []);
+    const fallbackCatalog = getModelsByProviderId(connection.provider) || [];
+    let models = (Array.isArray(parsed) && parsed.length > 0)
+      ? [...parsed]
+      : (pDef?.models && pDef.models.length > 0 ? [...pDef.models] : fallbackCatalog);
 
     return buildModelsResponse({
       provider: connection.provider,
