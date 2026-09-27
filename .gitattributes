@@ -1,0 +1,47 @@
+# Default: normalise to LF in the repository.
+#
+# This repo is LF-only in every committed blob, but on Windows/WSL checkouts
+# (and after `npm install`) working files are rewritten as CRLF. That churn has
+# a real failure mode beyond noisy diffs: a CRLF `.dockerignore` breaks the
+# build with "invalid file request", because Docker matches the pattern with the
+# trailing CR attached, so `tests` fails to match `tests/` and the whole
+# tests/node_modules tree (including the .bin/* symlinks) gets pulled into the
+# build context.
+* text=auto eol=lf
+
+# Must stay LF byte-for-byte: a trailing CR here changes the parsed value and
+# silently breaks the consumer.
+.gitattributes text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+.npmignore text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+
+# No CRLF exceptions: the only Windows script in the tree (cli/.../tray.ps1) is
+# already LF in HEAD, and PowerShell runs LF scripts fine. Pinning it to CRLF
+# would rewrite all 130 of its lines for no reason.
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.wasm binary

@@ -8,6 +8,8 @@
 
 # Dependencies and build output
 node_modules
+**/node_modules
+tests
 .next
 out
 build
