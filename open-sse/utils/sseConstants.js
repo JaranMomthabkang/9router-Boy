@@ -4,7 +4,8 @@ export const SSE_DONE = "data: [DONE]\n\n";
 export const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
-  "Connection": "keep-alive"
+  "Connection": "keep-alive",
+  "X-Accel-Buffering": "no"
 };
 
 // Variant for web-cookie executors behind nginx (disable proxy buffering)
@@ -19,5 +20,6 @@ export const SSE_HEADERS_CORS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   "Connection": "keep-alive",
+  "X-Accel-Buffering": "no",
   "Access-Control-Allow-Origin": "*"
 };

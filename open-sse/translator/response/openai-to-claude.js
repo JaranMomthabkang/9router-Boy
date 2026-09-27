@@ -1,8 +1,11 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { ROLE, CLAUDE_BLOCK, MODEL_FALLBACK } from "../schema/index.js";
+import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature.js";
 import { fromOpenAIFinish } from "../concerns/finishReason.js";
-import { extractReasoningText } from "../concerns/reasoning.js";
+import { extractReasoningText, processStreamThinkingTags } from "../concerns/reasoning.js";
+import { accumulateToolName } from "../concerns/toolCall.js";
+import { repairDuplicatedJsonArguments } from "../concerns/toolArgs.js";
 
 // Legacy "proxy_" prefix used by older request translators. Response strips it
 // defensively so tool names from such turns resolve back (e.g. proxy_Read → Read
@@ -69,7 +72,15 @@ function stopTextBlock(state, results) {
 
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  if (!chunk || !chunk.choices?.[0]) return null;
+  // Stream teardown (flush path passes null): drop pending whitespace so
+  // pooled/reused state cannot leak it into the next stream. Non-null
+  // chunks without choices[0] are legitimate metadata/usage frames
+  // (e.g. stream_options.include_usage) — ignore without touching state.
+  if (!chunk) {
+    if (state) state.leadingWhitespaceBuf = "";
+    return null;
+  }
+  if (!chunk.choices?.[0]) return null;
 
   const results = [];
   const choice = chunk.choices[0];
@@ -146,7 +157,7 @@ export function openaiToClaudeResponse(chunk, state) {
       results.push({
         type: "content_block_start",
         index: state.thinkingBlockIndex,
-        content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "" }
+        content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "", signature: DEFAULT_THINKING_CLAUDE_SIGNATURE }
       });
     }
 
@@ -157,11 +168,37 @@ export function openaiToClaudeResponse(chunk, state) {
     });
   }
 
-  // Handle regular content
-  if (delta?.content) {
+  // Handle regular content (supporting inline <think> tags statefully across SSE chunks)
+  const { thinking: inlineThinking, text: cleanedText } = processStreamThinkingTags(delta?.content, state);
+
+  if (inlineThinking) {
+    stopTextBlock(state, results);
+
+    if (!state.thinkingBlockStarted) {
+      state.thinkingBlockIndex = state.nextBlockIndex++;
+      state.thinkingBlockStarted = true;
+      results.push({
+        type: "content_block_start",
+        index: state.thinkingBlockIndex,
+        content_block: { type: CLAUDE_BLOCK.THINKING, thinking: "", signature: DEFAULT_THINKING_CLAUDE_SIGNATURE }
+      });
+    }
+
+    results.push({
+      type: "content_block_delta",
+      index: state.thinkingBlockIndex,
+      delta: { type: "thinking_delta", thinking: inlineThinking }
+    });
+  }
+
+  const hasText = typeof cleanedText === "string" && cleanedText.length > 0;
+  const hasNonWhitespaceText = hasText && cleanedText.trim().length > 0;
+
+  if (hasNonWhitespaceText) {
     stopThinkingBlock(state, results);
 
-    if (!state.textBlockStarted) {
+    // Reopen when never opened OR after a close (closed block index is dead).
+    if (!state.textBlockStarted || state.textBlockClosed) {
       state.textBlockIndex = state.nextBlockIndex++;
       state.textBlockStarted = true;
       state.textBlockClosed = false;
@@ -170,53 +207,122 @@ export function openaiToClaudeResponse(chunk, state) {
         index: state.textBlockIndex,
         content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
       });
+      // Flush buffered leading whitespace first so indented/code responses
+      // keep their exact formatting.
+      if (state.leadingWhitespaceBuf) {
+        results.push({
+          type: "content_block_delta",
+          index: state.textBlockIndex,
+          delta: { type: "text_delta", text: state.leadingWhitespaceBuf }
+        });
+        state.leadingWhitespaceBuf = "";
+      }
     }
 
     results.push({
       type: "content_block_delta",
       index: state.textBlockIndex,
-      delta: { type: "text_delta", text: delta.content }
+      delta: { type: "text_delta", text: cleanedText }
     });
+  } else if (hasText) {
+    stopThinkingBlock(state, results);
+    // Forward whitespace-only deltas when a text block is already open so
+    // newlines/indentation inside lists and code blocks are preserved.
+    if (state.textBlockStarted && !state.textBlockClosed) {
+      results.push({
+        type: "content_block_delta",
+        index: state.textBlockIndex,
+        delta: { type: "text_delta", text: cleanedText }
+      });
+    } else {
+      // Buffer whenever no writable text block exists — before the first
+      // block AND after a close (pending whitespace for the next block).
+      // Overflow policy: open a text block and flush instead of silently
+      // truncating, so exact formatting is never lost without a signal.
+      const MAX_LEADING_WHITESPACE = 64 * 1024;
+      const current = state.leadingWhitespaceBuf || "";
+      const pending = current + cleanedText;
+      if (pending.length > MAX_LEADING_WHITESPACE) {
+        state.textBlockIndex = state.nextBlockIndex++;
+        state.textBlockStarted = true;
+        state.textBlockClosed = false;
+        results.push({
+          type: "content_block_start",
+          index: state.textBlockIndex,
+          content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
+        });
+        results.push({
+          type: "content_block_delta",
+          index: state.textBlockIndex,
+          delta: { type: "text_delta", text: pending }
+        });
+        state.leadingWhitespaceBuf = "";
+      } else {
+        state.leadingWhitespaceBuf = pending;
+      }
+    }
   }
 
   // Tool calls
+  // Providers disagree on WHEN the tool name arrives: deepseek/claude send it
+  // in the first chunk (alongside the id), while GLM 5.2 / GPT / grok open the
+  // call with an id and stream the name in a LATER chunk (sometimes split across
+  // several). The old code read `tc.function?.name || ""` once, at first sight
+  // of the id, and emitted content_block_start immediately — so a late name was
+  // lost and the block shipped with name:"" (Claude clients then reject it with
+  // "No such tool available: "). We now ACCUMULATE both name and args across
+  // chunks and defer the block emission to finish (the same shape the
+  // antigravity translator already uses), so the name is always complete.
   if (delta?.tool_calls) {
+    // A tool turn supersedes pending pre-tool whitespace: flush it into its
+    // own text block first so upstream ordering (text, then tool) survives.
+    // A text chunk carrying both content + tool_calls in one delta is
+    // processed above (text first), so by here the buffer only holds
+    // whitespace from strictly earlier whitespace-only deltas.
+    if (state.leadingWhitespaceBuf) {
+      state.textBlockIndex = state.nextBlockIndex++;
+      state.textBlockStarted = true;
+      state.textBlockClosed = false;
+      results.push({
+        type: "content_block_start",
+        index: state.textBlockIndex,
+        content_block: { type: CLAUDE_BLOCK.TEXT, text: "" }
+      });
+      results.push({
+        type: "content_block_delta",
+        index: state.textBlockIndex,
+        delta: { type: "text_delta", text: state.leadingWhitespaceBuf }
+      });
+      results.push({
+        type: "content_block_stop",
+        index: state.textBlockIndex
+      });
+      state.textBlockClosed = true;
+      state.leadingWhitespaceBuf = "";
+    }
+    if (!state.toolCalls) state.toolCalls = new Map();
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
 
-      // GLM/fireworks repeats id+null-name on every arg chunk; open block once per idx
-      if (tc.id && !state.toolCalls.has(idx)) {
-        stopThinkingBlock(state, results);
-        stopTextBlock(state, results);
+      // Open a provisional slot keyed on index alone so a name/args fragment
+      // that arrives before the id is not lost (some providers stream them out
+      // of order). The id and name are filled in as their fragments arrive; a
+      // slot that never gets both is dropped at finish.
+      if (!state.toolCalls.has(idx)) {
+        state.toolCalls.set(idx, { id: null, name: "" });
+      }
+      const toolInfo = state.toolCalls.get(idx);
+      if (tc.id) toolInfo.id = toolInfo.id || tc.id;
 
-        const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
-
-        // Strip prefix from tool name for response
-        let toolName = tc.function?.name || "";
-        if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
-          toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
-        }
-
-        results.push({
-          type: "content_block_start",
-          index: toolBlockIndex,
-          content_block: {
-            type: CLAUDE_BLOCK.TOOL_USE,
-            id: tc.id,
-            name: toolName,
-            input: {}
-          }
-        });
+      // Merge the name fragment, tolerating split / re-echo / snapshot shapes.
+      if (tc.function?.name) {
+        toolInfo.name = accumulateToolName(toolInfo.name, tc.function.name);
       }
 
+      // Buffer args — sanitized and emitted at finish to fix bad params.
       if (tc.function?.arguments) {
-        const toolInfo = state.toolCalls.get(idx);
-        if (toolInfo) {
-          // Buffer args instead of streaming — sanitize at finish to fix bad params
-          if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
-        }
+        if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
+        state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
       }
     }
   }
@@ -225,32 +331,70 @@ export function openaiToClaudeResponse(chunk, state) {
   if (choice.finish_reason) {
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
+    // Whitespace-only streams never opened a block: clear any buffered
+    // leading whitespace so pooled/reused state cannot leak it.
+    state.leadingWhitespaceBuf = "";
 
-    for (const [idx, toolInfo] of state.toolCalls) {
-      // Emit buffered + sanitized args as single delta before stop
+    let emittedToolBlocks = 0;
+    for (const [idx, toolInfo] of (state.toolCalls || [])) {
+      // Resolve the fully-accumulated name; strip the legacy proxy_ prefix.
+      let toolName = toolInfo.name || "";
+      if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
+        toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
+      }
+
+      // A provisional slot that never received both an id and a name cannot be
+      // a valid tool_use — a nameless (or id-less) block is exactly what Claude
+      // clients reject, so drop it.
+      if (!toolInfo.id || !toolName) continue;
+      emittedToolBlocks++;
+
+      // Allocate the block index now (deferred from first-sight of the id) so
+      // it always follows any text/thinking blocks already flushed above.
+      const toolBlockIndex = state.nextBlockIndex++;
+      results.push({
+        type: "content_block_start",
+        index: toolBlockIndex,
+        content_block: {
+          type: CLAUDE_BLOCK.TOOL_USE,
+          id: toolInfo.id,
+          name: toolName,
+          input: {}
+        }
+      });
+
+      // Emit buffered + sanitized args as a single delta before stop.
       const buffered = state.toolArgBuffers?.get(idx);
       if (buffered) {
-        const sanitized = sanitizeToolArgs(toolInfo.name, buffered);
+        const sanitized = sanitizeToolArgs(toolInfo.name, repairDuplicatedJsonArguments(buffered));
         results.push({
           type: "content_block_delta",
-          index: toolInfo.blockIndex,
+          index: toolBlockIndex,
           delta: { type: "input_json_delta", partial_json: sanitized }
         });
       }
       results.push({
         type: "content_block_stop",
-        index: toolInfo.blockIndex
+        index: toolBlockIndex
       });
     }
 
     // Mark finish for later usage injection in stream.js
     state.finishReason = choice.finish_reason;
 
+    // If every tool call was dropped (no valid block emitted), a
+    // stop_reason of "tool_use" would tell the client to run tools that
+    // don't exist — some clients hang on that. Downgrade to end_turn.
+    let stopReason = convertFinishReason(choice.finish_reason);
+    if (stopReason === "tool_use" && emittedToolBlocks === 0) {
+      stopReason = "end_turn";
+    }
+
     // Use tracked usage (will be estimated in stream.js if not valid)
     const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
     results.push({
       type: "message_delta",
-      delta: { stop_reason: convertFinishReason(choice.finish_reason) },
+      delta: { stop_reason: stopReason },
       usage: finalUsage
     });
     results.push({ type: "message_stop" });

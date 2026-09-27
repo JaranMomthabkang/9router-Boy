@@ -1,14 +1,54 @@
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 
-const DEFAULT_MAX_RECORDS = 200;
+const DEFAULT_MAX_RECORDS = 3000;
 const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_MAX_JSON_SIZE = 5 * 1024;
+// 1-day retention: requestDetails blobs dominate DB size (615MB/10k rows
+// observed); dashboard history beyond a day is not worth the disk.
+const DEFAULT_RETENTION_DAYS = 1;
+const PRUNE_THROTTLE_MS = 5 * 60 * 1000; // 5 min
+let lastPruneTs = 0;
 const CONFIG_CACHE_TTL_MS = 5000;
 
 let cachedConfig = null;
 let cachedConfigTs = 0;
+
+function parseNum(val, fallback) {
+  if (typeof val === "number" && Number.isFinite(val)) return val;
+  if (typeof val === "string" && val.trim() !== "") {
+    const parsed = parseInt(val, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+export function resetPruneThrottle() {
+  lastPruneTs = 0;
+}
+
+export function pruneRequestDetailsSync(adapter, config = {}) {
+  const retentionDays = parseNum(config.retentionDays, DEFAULT_RETENTION_DAYS);
+  const maxRecords = parseNum(config.maxRecords, DEFAULT_MAX_RECORDS);
+
+  if (retentionDays > 0) {
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    try { adapter.run(`DELETE FROM requestDetails WHERE timestamp < ?`, [cutoff]); } catch {}
+  }
+
+  if (maxRecords > 0) {
+    try {
+      const cnt = adapter.get(`SELECT COUNT(*) as c FROM requestDetails`);
+      if (cnt && cnt.c > maxRecords) {
+        adapter.run(
+          `DELETE FROM requestDetails WHERE id IN (SELECT id FROM requestDetails ORDER BY timestamp ASC LIMIT ?)`,
+          [cnt.c - maxRecords]
+        );
+      }
+    } catch {}
+  }
+}
 
 async function getObservabilityConfig() {
   if (cachedConfig && (Date.now() - cachedConfigTs) < CONFIG_CACHE_TTL_MS) return cachedConfig;
@@ -16,35 +56,25 @@ async function getObservabilityConfig() {
     const { getSettings } = await import("./settingsRepo.js");
     const settings = await getSettings();
     const envRequestLogs = process.env.ENABLE_REQUEST_LOGS;
-    if (envRequestLogs !== undefined) {
-      const enabled = envRequestLogs.toLowerCase() === "true";
-      cachedConfig = {
-        enabled,
-        maxRecords: settings.observabilityMaxRecords || parseInt(process.env.OBSERVABILITY_MAX_RECORDS || String(DEFAULT_MAX_RECORDS), 10),
-        batchSize: settings.observabilityBatchSize || parseInt(process.env.OBSERVABILITY_BATCH_SIZE || String(DEFAULT_BATCH_SIZE), 10),
-        flushIntervalMs: settings.observabilityFlushIntervalMs || parseInt(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS || String(DEFAULT_FLUSH_INTERVAL_MS), 10),
-        maxJsonSize: (settings.observabilityMaxJsonSize || parseInt(process.env.OBSERVABILITY_MAX_JSON_SIZE || "5", 10)) * 1024,
-      };
-      cachedConfigTs = Date.now();
-      return cachedConfig;
-    }
     const envFallback = process.env.OBSERVABILITY_ENABLED !== "false";
     const uiFlag = typeof settings.enableObservability === "boolean";
-    const enabled = uiFlag
-      ? settings.enableObservability
-      : envFallback;
+    const enabled = envRequestLogs !== undefined
+      ? envRequestLogs.toLowerCase() === "true"
+      : (uiFlag ? settings.enableObservability : envFallback);
 
     cachedConfig = {
       enabled,
-      maxRecords: settings.observabilityMaxRecords || parseInt(process.env.OBSERVABILITY_MAX_RECORDS || String(DEFAULT_MAX_RECORDS), 10),
-      batchSize: settings.observabilityBatchSize || parseInt(process.env.OBSERVABILITY_BATCH_SIZE || String(DEFAULT_BATCH_SIZE), 10),
-      flushIntervalMs: settings.observabilityFlushIntervalMs || parseInt(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS || String(DEFAULT_FLUSH_INTERVAL_MS), 10),
-      maxJsonSize: (settings.observabilityMaxJsonSize || parseInt(process.env.OBSERVABILITY_MAX_JSON_SIZE || "5", 10)) * 1024,
+      maxRecords: parseNum(settings.observabilityMaxRecords, parseNum(process.env.OBSERVABILITY_MAX_RECORDS, DEFAULT_MAX_RECORDS)),
+      retentionDays: parseNum(settings.observabilityRetentionDays, parseNum(process.env.OBSERVABILITY_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)),
+      batchSize: parseNum(settings.observabilityBatchSize, parseNum(process.env.OBSERVABILITY_BATCH_SIZE, DEFAULT_BATCH_SIZE)),
+      flushIntervalMs: parseNum(settings.observabilityFlushIntervalMs, parseNum(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS, DEFAULT_FLUSH_INTERVAL_MS)),
+      maxJsonSize: parseNum(settings.observabilityMaxJsonSize, parseNum(process.env.OBSERVABILITY_MAX_JSON_SIZE, 5)) * 1024,
     };
   } catch {
     cachedConfig = {
       enabled: false,
       maxRecords: DEFAULT_MAX_RECORDS,
+      retentionDays: DEFAULT_RETENTION_DAYS,
       batchSize: DEFAULT_BATCH_SIZE,
       flushIntervalMs: DEFAULT_FLUSH_INTERVAL_MS,
       maxJsonSize: DEFAULT_MAX_JSON_SIZE,
@@ -77,12 +107,49 @@ function generateDetailId(model) {
   return `${timestamp}-${random}-${modelPart}`;
 }
 
+function estimatePayloadSize(obj) {
+  if (typeof obj?.prompt === "string") return obj.prompt.length;
+  let total = 0;
+  const list = Array.isArray(obj?.messages) ? obj.messages : (Array.isArray(obj?.contents) ? obj.contents : null);
+  if (list) {
+    for (const item of list) {
+      if (typeof item?.content === "string") {
+        total += item.content.length;
+      } else if (Array.isArray(item?.content)) {
+        for (const block of item.content) {
+          if (typeof block?.text === "string") total += block.text.length;
+        }
+      } else if (Array.isArray(item?.parts)) {
+        for (const part of item.parts) {
+          if (typeof part?.text === "string") total += part.text.length;
+        }
+      }
+      if (total > 64 * 1024) break;
+    }
+  }
+  return total;
+}
+
 function truncateField(obj, maxSize) {
-  const str = JSON.stringify(obj || {});
+  if (!obj) return {};
+  if (typeof obj === "string") {
+    if (obj.length > maxSize) {
+      return { _truncated: true, _originalSize: obj.length, _preview: obj.substring(0, 200) };
+    }
+    return obj;
+  }
+  const est = estimatePayloadSize(obj);
+  if (est > maxSize) {
+    let preview = "[large payload]";
+    if (typeof obj.prompt === "string") preview = obj.prompt.substring(0, 200);
+    else if (Array.isArray(obj.messages) && typeof obj.messages[0]?.content === "string") preview = obj.messages[0].content.substring(0, 200);
+    return { _truncated: true, _originalSize: est, _preview: preview };
+  }
+  const str = JSON.stringify(obj);
   if (str.length > maxSize) {
     return { _truncated: true, _originalSize: str.length, _preview: str.substring(0, 200) };
   }
-  return obj || {};
+  return obj;
 }
 
 async function flushToDatabase() {
@@ -124,12 +191,23 @@ async function flushToDatabase() {
           );
         }
 
-        const cnt = db.get(`SELECT COUNT(*) as c FROM requestDetails`);
-        if (cnt && cnt.c > config.maxRecords) {
-          db.run(
-            `DELETE FROM requestDetails WHERE id IN (SELECT id FROM requestDetails ORDER BY timestamp ASC LIMIT ?)`,
-            [cnt.c - config.maxRecords]
-          );
+        // Time-based retention (throttled to at most once per 5 minutes):
+        const nowMs = Date.now();
+        if (config.retentionDays > 0 && (nowMs - lastPruneTs >= PRUNE_THROTTLE_MS)) {
+          const cutoff = new Date(nowMs - config.retentionDays * 24 * 60 * 60 * 1000).toISOString();
+          db.run(`DELETE FROM requestDetails WHERE timestamp < ?`, [cutoff]);
+          lastPruneTs = nowMs;
+        }
+
+        // Count cap as a safety net: keep the newest maxRecords rows
+        if (config.maxRecords > 0) {
+          const cnt = db.get(`SELECT COUNT(*) as c FROM requestDetails`);
+          if (cnt && cnt.c > config.maxRecords) {
+            db.run(
+              `DELETE FROM requestDetails WHERE id IN (SELECT id FROM requestDetails ORDER BY timestamp ASC LIMIT ?)`,
+              [cnt.c - config.maxRecords]
+            );
+          }
         }
       });
     }
