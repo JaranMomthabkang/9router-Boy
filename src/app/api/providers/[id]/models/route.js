@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
-import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
+import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isPublicModelsProvider } from "@/shared/constants/providers";
 import { GEMINI_CONFIG, ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
 import { refreshGoogleToken, refreshCodexToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
-import { resolveOllamaLocalHost } from "open-sse/config/providers.js";
+import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import { getModelsByProviderId } from "open-sse/config/providerModels.js";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
 import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
@@ -13,6 +13,9 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { resolveClineModels, resolveClinepassModels } from "open-sse/services/clinepassModels.js";
+import { parseCloudflareModelsResponse } from "@/lib/cloudflareAiModels";
+import { formatModelsFetchError, safeLogDetail } from "@/lib/upstreamErrorDetail";
+import { refreshProviderCredentials } from "open-sse/services/oauthCredentialManager.js";
 
 const GEMINI_CLI_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 
@@ -87,6 +90,84 @@ const getStaticProviderModels = (providerId) =>
     id: model.id,
     name: model.name || model.id,
   }));
+
+// Enrich models with lastSyncedAt / firstSeenAt from the syncedModels kv.
+// Only stamps when models.length > 0 (empty list is a static-fallback signal).
+export async function buildModelsResponse({ provider, connectionId, models, warning }) {
+  const rawModels = Array.isArray(models) ? models.filter((m) => m && m.id) : [];
+  // Dedup by model ID (upstream may return duplicates)
+  const seen = new Set();
+  const safeModels = [];
+  for (const m of rawModels) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    safeModels.push(m);
+  }
+  let stampMap = {};
+  if (safeModels.length > 0 && connectionId) {
+    try {
+      const db = await import("@/lib/db");
+      if (typeof db.stampSyncedModels === "function") {
+        await db.stampSyncedModels(safeModels.map((m) => ({ connectionId, modelId: m.id })));
+      }
+      if (typeof db.getSyncedModelsMap === "function") {
+        stampMap = (await db.getSyncedModelsMap()) || {};
+      }
+
+      // Extract & persist dynamic capabilities metadata from upstream response
+      try {
+        if (typeof db.saveModelDynamicCapabilities === "function") {
+          for (const m of safeModels) {
+            const id = m.id;
+            const ctx = m.max_context_window || m.context_length || m.contextWindow || m.context_window || m.maxInputTokens || m.contextLength || m.details?.context_length;
+            const vision = m.vision ?? m.supportsImages ?? m.supportsVision ?? m.details?.families?.includes("vision")
+              ?? (Array.isArray(m.input_modalities) ? m.input_modalities.includes("image") : undefined);
+            
+            let resolvedReasoning = undefined;
+            if (typeof m.reasoning === "boolean") {
+              resolvedReasoning = m.reasoning;
+            } else if (Array.isArray(m.thinking) && m.thinking.length > 0) {
+              resolvedReasoning = true;
+            } else if (typeof m.thinking === "boolean") {
+              resolvedReasoning = m.thinking;
+            }
+
+            const ctxNum = Number(ctx);
+            const hasValidCtx = Number.isFinite(ctxNum) && ctxNum > 0;
+
+            if (hasValidCtx || vision !== undefined || resolvedReasoning !== undefined) {
+              const caps = {};
+              if (hasValidCtx) caps.contextWindow = ctxNum;
+              if (vision !== undefined) caps.vision = Boolean(vision);
+              if (resolvedReasoning !== undefined) caps.reasoning = resolvedReasoning;
+              await db.saveModelDynamicCapabilities(provider, id, caps);
+            }
+          }
+        }
+      } catch (capErr) {
+        console.log("Failed to save dynamic capabilities:", capErr?.message);
+      }
+    } catch (error) {
+      console.log("Failed to stamp synced models:", error?.message);
+      stampMap = {};
+    }
+  }
+  const enrichedModels = safeModels.map((m) => {
+    const entry = stampMap[`${connectionId}:${m.id}`];
+    return {
+      ...m,
+      lastSyncedAt: entry?.lastSyncedAt ?? null,
+      firstSeenAt: entry?.firstSeenAt ?? null,
+    };
+  });
+  const payload = {
+    provider,
+    connectionId,
+    models: enrichedModels,
+  };
+  if (warning !== undefined) payload.warning = warning;
+  return NextResponse.json(payload);
+}
 
 // Generic custom resolver for OAuth providers that need refresh-on-401 + token persist.
 // Receives a `fetchFn(token)` and returns parsed models or throws.
@@ -517,9 +598,31 @@ const PROVIDER_MODELS_CONFIG = {
         return { error: `Failed to fetch models: ${response.status}`, status: response.status };
       }
       const data = await response.json();
-      return { models: parseOpenAIStyleModels(data) };
+      const raw = data.models || data.data || [];
+      const models = raw.map((m) => {
+        if (typeof m === "string") return { id: m, name: m };
+        const id = m.name || m.model || m.id;
+        if (!id) return null;
+        return {
+          id,
+          name: m.name || m.id || id,
+          size: m.size || 0,
+          details: m.details || {},
+          contextLength: m.contextLength || m.details?.context_length || 0,
+          modified_at: m.modified_at,
+        };
+      }).filter(Boolean);
+      return { models };
     }
-  }
+  },
+  "cloudflare-ai": {
+    url: "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/models/search",
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    authHeader: "Authorization",
+    authPrefix: "Bearer ",
+    parseResponse: parseCloudflareModelsResponse,
+  },
 };
 
 /**
@@ -528,10 +631,19 @@ const PROVIDER_MODELS_CONFIG = {
 export async function GET(request, { params }) {
   try {
     const { id } = await params;
-    const connection = await getProviderConnectionById(id);
+    let connection = await getProviderConnectionById(id);
 
     if (!connection) {
-      return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+      if (isPublicModelsProvider(id)) {
+        connection = {
+          id: `public:${id}`,
+          provider: id,
+          authType: "none",
+          isActive: true,
+        };
+      } else {
+        return NextResponse.json({ error: "Connection not found" }, { status: 404 });
+      }
     }
 
     if (isOpenAICompatibleProvider(connection.provider)) {
@@ -550,9 +662,9 @@ export async function GET(request, { params }) {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, errorText);
+        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
         return NextResponse.json(
-          { error: `Failed to fetch models: ${response.status}` },
+          { error: formatModelsFetchError(response.status, errorText) },
           { status: response.status }
         );
       }
@@ -560,7 +672,7 @@ export async function GET(request, { params }) {
       const data = await response.json();
       const models = data.data || data.models || [];
 
-      return NextResponse.json({
+      return buildModelsResponse({
         provider: connection.provider,
         connectionId: connection.id,
         models
@@ -591,9 +703,9 @@ export async function GET(request, { params }) {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, errorText);
+        console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
         return NextResponse.json(
-          { error: `Failed to fetch models: ${response.status}` },
+          { error: formatModelsFetchError(response.status, errorText) },
           { status: response.status }
         );
       }
@@ -601,15 +713,45 @@ export async function GET(request, { params }) {
       const data = await response.json();
       const models = data.data || data.models || [];
 
-      return NextResponse.json({
+      return buildModelsResponse({
         provider: connection.provider,
         connectionId: connection.id,
         models
       });
     }
 
-    const config = PROVIDER_MODELS_CONFIG[connection.provider];
+    let config = PROVIDER_MODELS_CONFIG[connection.provider];
+    const pDef = PROVIDERS[connection.provider];
+
+    if (!config && pDef) {
+      const baseUrl = pDef.baseUrl || pDef.transport?.baseUrl || "";
+      const modelsUrl = pDef.transport?.validateUrl ||
+        (baseUrl ? baseUrl.replace(/\/chat\/completions$/, "/models").replace(/\/conversation$/, "/models").replace(/\/messages$/, "/models") : "");
+
+      if (modelsUrl) {
+        config = {
+          url: modelsUrl,
+          method: "GET",
+          headers: {
+            "Content-Type": "application/json",
+            ...(pDef.transport?.headers || pDef.headers || {}),
+          },
+          authHeader: pDef.authHeader === "x-api-key" ? "x-api-key" : (pDef.authType === "none" ? undefined : "Authorization"),
+          authPrefix: pDef.authHeader === "x-api-key" ? "" : (pDef.authType === "none" ? "" : "Bearer "),
+          parseResponse: (data) => parseOpenAIStyleModels(data),
+        };
+      }
+    }
+
     if (!config) {
+      const staticModels = pDef?.models || [];
+      if (staticModels.length > 0) {
+        return buildModelsResponse({
+          provider: connection.provider,
+          connectionId: connection.id,
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        });
+      }
       return NextResponse.json(
         { error: `Provider ${connection.provider} does not support models listing` },
         { status: 400 }
@@ -622,29 +764,36 @@ export async function GET(request, { params }) {
       if (result.error) {
         return NextResponse.json({ error: result.error }, { status: result.status || 500 });
       }
-      return NextResponse.json({
+      return buildModelsResponse({
         provider: connection.provider,
         connectionId: connection.id,
         models: result.models,
-        ...(result.warning ? { warning: result.warning } : {})
+        warning: result.warning
       });
     }
 
     // Get auth token
-    const token = connection.providerSpecificData?.copilotToken || connection.accessToken || connection.apiKey;
-    if (!token) {
+    let token = connection.providerSpecificData?.copilotToken || connection.accessToken || connection.apiKey;
+    if (!token && !isPublicModelsProvider(connection.provider)) {
       return NextResponse.json({ error: "No valid token found" }, { status: 401 });
     }
 
     // Build request URL
     let url = config.url;
-    if (config.authQuery) {
+    if (url.includes("{accountId}")) {
+      const accountId = connection.providerSpecificData?.accountId;
+      if (!accountId) {
+        return NextResponse.json({ error: "cloudflare-ai requires accountId in providerSpecificData" }, { status: 400 });
+      }
+      url = url.replace("{accountId}", encodeURIComponent(accountId));
+    }
+    if (config.authQuery && token) {
       url += `?${config.authQuery}=${token}`;
     }
 
     // Build headers
     const headers = { ...config.headers };
-    if (config.authHeader && !config.authQuery) {
+    if (config.authHeader && !config.authQuery && token) {
       headers[config.authHeader] = (config.authPrefix || "") + token;
     }
 
@@ -658,21 +807,72 @@ export async function GET(request, { params }) {
       fetchOptions.body = JSON.stringify(config.body);
     }
 
-    const response = await fetch(url, fetchOptions);
+    let response;
+    try {
+      response = await fetch(url, fetchOptions);
+    } catch (networkErr) {
+      console.log(`Network error fetching models from ${connection.provider}:`, networkErr?.message);
+      const staticModels = pDef?.models || [];
+      if (staticModels.length > 0) {
+        return buildModelsResponse({
+          provider: connection.provider,
+          connectionId: connection.id,
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        });
+      }
+      throw networkErr;
+    }
+
+    // OAuth token refresh on 401/403
+    const usesCopilotToken = !!connection.providerSpecificData?.copilotToken;
+    const isGoogleCliProvider = connection.provider === "antigravity" || connection.provider === "gemini-cli";
+    const isRefreshableStatus = isGoogleCliProvider ? response.status === 401 : (response.status === 401 || response.status === 403);
+    if (
+      !response.ok &&
+      isRefreshableStatus &&
+      connection.refreshToken &&
+      !usesCopilotToken
+    ) {
+      try {
+        const refreshed = await refreshProviderCredentials(connection.provider, connection, console);
+
+        if (refreshed?.accessToken) {
+          await updateProviderCredentials(connection.id, refreshed);
+
+          token = refreshed.accessToken;
+          if (config.authHeader && !config.authQuery && token) {
+            headers[config.authHeader] = (config.authPrefix || "") + token;
+          }
+          response = await fetch(url, fetchOptions);
+        }
+      } catch (refreshError) {
+        console.log(`Error refreshing token for ${connection.provider}:`, refreshError);
+      }
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.log(`Error fetching models from ${connection.provider}:`, errorText);
+      console.log(`Error fetching models from ${connection.provider}:`, safeLogDetail(response.status, errorText));
+      const staticModels = pDef?.models || [];
+      const isPublic = connection.id?.startsWith("public:") || isPublicModelsProvider(connection.provider);
+      if (staticModels.length > 0 && isPublic) {
+        return buildModelsResponse({
+          provider: connection.provider,
+          connectionId: connection.id,
+          models: staticModels.map((m) => typeof m === "string" ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id, ...m }),
+        });
+      }
       return NextResponse.json(
-        { error: `Failed to fetch models: ${response.status}` },
+        { error: formatModelsFetchError(response.status, errorText) },
         { status: response.status }
       );
     }
 
     const data = await response.json();
-    const models = config.parseResponse(data);
+    const parsed = config.parseResponse(data);
+    let models = (Array.isArray(parsed) && parsed.length > 0) ? [...parsed] : (pDef?.models ? [...pDef.models] : []);
 
-    return NextResponse.json({
+    return buildModelsResponse({
       provider: connection.provider,
       connectionId: connection.id,
       models

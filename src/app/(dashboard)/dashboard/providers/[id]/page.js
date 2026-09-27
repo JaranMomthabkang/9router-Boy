@@ -6,7 +6,7 @@ import Link from "next/link";
 import Image from "next/image";
 import { getProviderIconSrc, markProviderIconMissing } from "@/shared/utils/providerIcon";
 import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, ZedAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
-import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
+import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS, providerSupportsModelSync, isPublicModelsProvider } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
@@ -23,6 +23,7 @@ import EditCompatibleNodeModal from "./EditCompatibleNodeModal";
 import AddCustomModelModal from "./AddCustomModelModal";
 import BulkImportCodexModal from "./BulkImportCodexModal";
 import BulkImportGrokCliModal from "./BulkImportGrokCliModal";
+import SyncProviderModelsModal from "./SyncProviderModelsModal";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
 
@@ -62,6 +63,7 @@ export default function ProviderDetailPage() {
   const [modelsTestError, setModelsTestError] = useState("");
   const [testingModelIds, setTestingModelIds] = useState(() => new Set());
   const [showAddCustomModel, setShowAddCustomModel] = useState(false);
+  const [showSyncModels, setShowSyncModels] = useState(false);
   const [selectedConnectionIds, setSelectedConnectionIds] = useState([]);
   const [bulkProxyPoolId, setBulkProxyPoolId] = useState("__none__");
   const [bulkUpdatingProxy, setBulkUpdatingProxy] = useState(false);
@@ -164,6 +166,9 @@ export default function ProviderDetailPage() {
   const isAnthropicCompatible = isAnthropicCompatibleProvider(providerId);
   const isCompatible = isOpenAICompatible || isAnthropicCompatible;
   const hasDualAuthModes = !isCompatible && isOAuth && supportsApiKeyAuth;
+  const canSyncModels = connections.some((conn) => conn.isActive !== false) || isPublicModelsProvider(providerId);
+  const providerDisplayAlias = providerNode?.prefix || providerAlias;
+  const providerStorageAlias = providerNode?.prefix || providerAlias;
   const oauthConnectionLabel =
     providerId === "xai" ? "Grok Build OAuth"
     : providerId === "grok-cli" ? "Grok CLI Device Login"
@@ -685,6 +690,65 @@ export default function ProviderDetailPage() {
       alert(translate("Error fetching models") + ": " + error.message);
     } finally {
       setImportingClineModels(false);
+    }
+  };
+
+  const resolveAvailableAlias = (baseAlias, usedAliases) => {
+    const cleanAlias = baseAlias.replace(/^models\//, "");
+    if (providerInfo.passthroughModels) {
+      if (!usedAliases.has(cleanAlias)) return cleanAlias;
+      let index = 2;
+      while (usedAliases.has(`${cleanAlias}-${index}`)) index += 1;
+      return `${cleanAlias}-${index}`;
+    }
+    const prefixed = `${providerDisplayAlias}-${cleanAlias}`;
+    if (!usedAliases.has(prefixed)) return prefixed;
+    let index = 2;
+    while (usedAliases.has(`${prefixed}-${index}`)) index += 1;
+    return `${prefixed}-${index}`;
+  };
+
+  const handleAddSyncedModels = async (items) => {
+    const usedAliases = new Set(Object.keys(modelAliases));
+    const usedModels = new Set(Object.values(modelAliases));
+
+    for (const item of items) {
+      if (!item?.id) continue;
+      const fullModel = `${providerStorageAlias}/${item.id}`;
+      if (usedModels.has(fullModel)) continue;
+      const alias = resolveAvailableAlias(item.alias || item.id, usedAliases);
+      const res = await fetch("/api/models/alias", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: fullModel, alias }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Failed to add ${item.id}`);
+      usedAliases.add(alias);
+      usedModels.add(fullModel);
+      const cw = Number(item.contextLength);
+      if (Number.isFinite(cw) && cw > 0) {
+        try {
+          await fetch("/api/models/custom", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              providerAlias: providerStorageAlias,
+              id: item.id,
+              type: "llm",
+              source: "synced",
+              contextLength: cw,
+            }),
+          });
+        } catch {
+          // fail-open
+        }
+      }
+    }
+    await Promise.all([fetchAliases(), fetchCustomModels()]);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("modelAliasesChanged"));
+      window.dispatchEvent(new CustomEvent("customModelChanged"));
     }
   };
 
@@ -1248,6 +1312,18 @@ export default function ProviderDetailPage() {
           Add Model
         </button>
 
+        {providerSupportsModelSync(providerId) && (
+          <button
+            onClick={() => setShowSyncModels(true)}
+            disabled={!canSyncModels}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-blue-500/40 px-3 py-2 text-xs text-blue-600 transition-colors hover:border-blue-500 hover:bg-blue-500/5 disabled:cursor-not-allowed disabled:opacity-50 dark:text-blue-400 sm:w-auto"
+            title={canSyncModels ? "Sync models from upstream" : "Add an active connection before syncing"}
+          >
+            <span className="material-symbols-outlined text-sm">sync</span>
+            Sync Models
+          </button>
+        )}
+
         {/* Import Qoder models button — only show for qoder/qoder-cn provider */}
         {(providerId === "qoder" || providerId === "qoder-cn") && connections.some((conn) => conn.isActive !== false) && (
           <button
@@ -1771,6 +1847,11 @@ export default function ProviderDetailPage() {
             const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
             return (
               <div className="flex gap-2">
+                {providerSupportsModelSync(providerId) && canSyncModels && (
+                  <Button size="sm" variant="secondary" icon="sync" onClick={() => setShowSyncModels(true)}>
+                    Sync Models
+                  </Button>
+                )}
                 {disabledModelIds.length > 0 && (
                   <Button size="sm" variant="secondary" icon="restart_alt" onClick={handleEnableAll}>
                     Active All
@@ -1960,6 +2041,25 @@ export default function ProviderDetailPage() {
         message={confirmState?.message}
         variant="danger"
       />
+
+      {!isCompatible && (
+        <SyncProviderModelsModal
+          isOpen={showSyncModels}
+          connections={connections}
+          existingModelIds={[
+            ...models.map((model) => model.id),
+            ...kiloFreeModels.map((model) => model.id),
+            ...Object.values(modelAliases)
+              .filter((fullModel) => fullModel.startsWith(`${providerStorageAlias}/`))
+              .map((fullModel) => fullModel.slice(`${providerStorageAlias}/`.length)),
+          ]}
+          providerDisplayAlias={providerDisplayAlias}
+          passthroughModels={!!providerInfo.passthroughModels}
+          providerId={providerId}
+          onAddModels={handleAddSyncedModels}
+          onClose={() => setShowSyncModels(false)}
+        />
+      )}
     </div>
   );
 }

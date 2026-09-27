@@ -67,6 +67,12 @@ export {
   saveRequestDetail, getRequestDetails, getRequestDetailById, getDistinctProviders,
 } from "./repos/requestDetailsRepo.js";
 
+// Synced models & dynamic capabilities
+export {
+  getSyncedModelsMap, stampSyncedModels, upsertSyncedModel,
+  getModelDynamicCapabilities, getAllModelDynamicCapabilities, saveModelDynamicCapabilities,
+} from "./repos/syncedModelsRepo.js";
+
 // Export/import full DB
 export async function exportDb() {
   const db = await getAdapter();

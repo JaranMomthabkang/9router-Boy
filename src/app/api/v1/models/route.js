@@ -366,6 +366,16 @@ export async function buildModelsList(kindFilter, options = {}) {
       });
     }
   } else {
+    let syncedCapabilitiesById = new Map();
+    try {
+      const { getAllModelDynamicCapabilities } = await import("@/lib/db");
+      if (typeof getAllModelDynamicCapabilities === "function") {
+        syncedCapabilitiesById = await getAllModelDynamicCapabilities();
+      }
+    } catch (e) {
+      console.log("Could not load synced dynamic capabilities:", e?.message);
+    }
+
     for (const [providerId, conn] of activeConnectionByProvider.entries()) {
       if (!providerMatchesKinds(providerId, kindFilter)) continue;
 
@@ -505,10 +515,20 @@ export async function buildModelsList(kindFilter, options = {}) {
         // { id, name } — no per-model capability data. Fall back to the same
         // pattern-matched capabilities the dashboard uses (useModelCaps.js) so
         // dynamically-discovered LLM models still surface vision/reasoning/search/tools.
+        const bareId = modelId.split("/").pop();
         const liveCaps = liveCapabilitiesById.get(modelId);
         const serviceCaps = capabilitiesFromServiceKind(customKind || liveKind);
-        const caps = liveCaps || serviceCaps || (kind === LLM_KIND ? getCapabilitiesForModel(providerId, modelId) : null);
-        if (caps) model.capabilities = caps;
+        const staticCaps = serviceCaps || (kind === LLM_KIND ? getCapabilitiesForModel(providerId, modelId) : null);
+        const syncedCaps = syncedCapabilitiesById.get(`${providerId}:${bareId}`)
+          || syncedCapabilitiesById.get(`${providerId}:${modelId}`)
+          || syncedCapabilitiesById.get(bareId)
+          || syncedCapabilitiesById.get(modelId);
+        const caps = {
+          ...(staticCaps || {}),
+          ...(syncedCaps || {}),
+          ...(liveCaps || {}),
+        };
+        if (Object.keys(caps).length > 0) model.capabilities = caps;
         // Token limits under the snake_case names the OpenAI/OpenRouter
         // convention uses. `capabilities.contextWindow` is camelCase and nested,
         // so clients matching context_length find nothing, fall back to guessing
