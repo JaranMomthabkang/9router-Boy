@@ -81,7 +81,16 @@ describe("getUsageForProvider(ollama)", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("GETs /api/usage with Bearer apiKey and POSTs /api/me for plan", async () => {
+    // Pin the clock: session/weekly resets are derived from Ollama's fixed
+    // global schedule, not from anything in the response.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-27T12:00:00Z"));
+
     proxyAwareFetch
       .mockResolvedValueOnce(jsonResponse(SAMPLE_USAGE))
       .mockResolvedValueOnce(jsonResponse(SAMPLE_ME));
@@ -109,6 +118,11 @@ describe("getUsageForProvider(ollama)", () => {
     // Must not set absolute remaining — UI treats remaining as %
     expect(usage.quotas["Session (5h)"].remaining).toBeUndefined();
     expect(usage.quotas["Weekly (7d)"].remaining).toBeUndefined();
+
+    // Session resets on the next 5h Unix-epoch boundary, weekly next Monday
+    // 00:00 UTC. Verified against the stamps ollama.com/settings renders.
+    expect(usage.quotas["Session (5h)"].resetAt).toBe("2026-09-27T13:00:00.000Z");
+    expect(usage.quotas["Weekly (7d)"].resetAt).toBe("2026-09-28T00:00:00.000Z");
 
     expect(proxyAwareFetch).toHaveBeenCalledTimes(2);
 
@@ -145,20 +159,53 @@ describe("getUsageForProvider(ollama)", () => {
       unlimited: false,
     });
     expect(usage.quotas["Monthly"].remaining).toBeUndefined();
+    // No anchor on /api/me, so the monthly anniversary is unknowable.
     expect(usage.quotas["Monthly"].resetAt).toBeNull();
   });
 
-  describe("free plan monthly reset from signup date", () => {
-    afterEach(() => {
-      vi.useRealTimers();
+  describe("session/weekly resets follow Ollama's fixed global schedule", () => {
+    async function resetsAt(now) {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(now));
+      proxyAwareFetch
+        .mockResolvedValueOnce(jsonResponse(SAMPLE_USAGE))
+        .mockResolvedValueOnce(jsonResponse(SAMPLE_ME));
+
+      const usage = await getUsageForProvider({
+        provider: "ollama",
+        apiKey: "k",
+        providerSpecificData: {},
+      });
+      return {
+        session: usage.quotas["Session (5h)"].resetAt,
+        weekly: usage.quotas["Weekly (7d)"].resetAt,
+      };
+    }
+
+    it("uses the next 5h Unix-epoch boundary, which drifts across the day", async () => {
+      // The 5h grid is not midnight-aligned (86400 % 18000 ≠ 0): on 2026-09-27
+      // the boundaries are 03:00 / 08:00 / 13:00 / 18:00 / 23:00 UTC.
+      expect((await resetsAt("2026-09-27T12:00:00Z")).session).toBe("2026-09-27T13:00:00.000Z");
+      expect((await resetsAt("2026-09-27T13:00:01Z")).session).toBe("2026-09-27T18:00:00.000Z");
+      // A real stamp from the settings page: 2026-04-23T11:00:00Z sits exactly
+      // on the grid, so the next reset is five hours later.
+      expect((await resetsAt("2026-04-23T11:00:00Z")).session).toBe("2026-04-23T16:00:00.000Z");
     });
 
-    async function monthlyResetAt(createdAt, now) {
+    it("uses Monday 00:00 UTC for the weekly window", async () => {
+      expect((await resetsAt("2026-08-16T12:00:00Z")).weekly).toBe("2026-08-17T00:00:00.000Z");
+      // Exactly on the boundary rolls a full week forward.
+      expect((await resetsAt("2026-08-17T00:00:00Z")).weekly).toBe("2026-08-24T00:00:00.000Z");
+    });
+  });
+
+  describe("monthly reset from the billing-period anchor", () => {
+    async function monthlyResetAt(me, now) {
       vi.useFakeTimers();
       vi.setSystemTime(new Date(now));
       proxyAwareFetch
         .mockResolvedValueOnce(jsonResponse(SAMPLE_FREE_USAGE))
-        .mockResolvedValueOnce(jsonResponse({ Plan: "free", CreatedAt: createdAt }));
+        .mockResolvedValueOnce(jsonResponse(me));
 
       const usage = await getUsageForProvider({
         provider: "ollama",
@@ -168,36 +215,47 @@ describe("getUsageForProvider(ollama)", () => {
       return usage.quotas["Monthly"].resetAt;
     }
 
-    it("uses the signup day of the next month", async () => {
-      expect(await monthlyResetAt("2025-09-06T22:15:39.871687Z", "2026-09-18T15:03:00Z"))
-        .toBe("2026-10-06T22:15:39.000Z");
+    it("prefers the billing period end, which /api/me sends as a Go NullTime", async () => {
+      const me = {
+        Plan: "pro",
+        CreatedAt: "2025-09-06T22:15:39.871687Z",
+        SubscriptionPeriodEnd: { Time: "2026-10-02T18:08:50Z", Valid: true },
+      };
+      expect(await monthlyResetAt(me, "2026-09-18T15:03:00Z")).toBe("2026-10-02T18:08:50.000Z");
     });
 
-    it("stays in the current month when the signup day is still ahead", async () => {
-      expect(await monthlyResetAt("2026-09-18T09:50:49.514335Z", "2026-09-18T15:33:33Z"))
-        .toBe("2026-10-18T09:50:49.000Z");
-      expect(await monthlyResetAt("2025-09-25T10:00:00Z", "2026-09-18T15:33:33Z"))
-        .toBe("2026-09-25T10:00:00.000Z");
+    it("falls back to the signup date when no period end is reported", async () => {
+      expect(await monthlyResetAt(
+        { Plan: "free", CreatedAt: "2025-09-06T22:15:39.871687Z" },
+        "2026-09-18T15:03:00Z",
+      )).toBe("2026-10-06T22:15:39.000Z");
     });
 
-    it("clamps the signup day to shorter months", async () => {
-      expect(await monthlyResetAt("2026-01-31T12:00:00Z", "2026-02-10T00:00:00Z"))
-        .toBe("2026-02-28T12:00:00.000Z");
+    it("ignores a NullTime whose Valid flag is false", async () => {
+      const me = {
+        Plan: "pro",
+        CreatedAt: "2025-09-06T22:15:39.871687Z",
+        SubscriptionPeriodEnd: { Time: "2026-10-02T18:08:50Z", Valid: false },
+      };
+      expect(await monthlyResetAt(me, "2026-09-18T15:03:00Z")).toBe("2026-10-06T22:15:39.000Z");
     });
 
-    it("skips the reset when the plan is not free", async () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date("2026-09-18T15:03:00Z"));
-      proxyAwareFetch
-        .mockResolvedValueOnce(jsonResponse(SAMPLE_FREE_USAGE))
-        .mockResolvedValueOnce(jsonResponse({ Plan: "pro", CreatedAt: "2025-09-06T22:15:39Z" }));
+    it("stays in the current month when the anniversary day is still ahead", async () => {
+      expect(await monthlyResetAt(
+        { Plan: "free", CreatedAt: "2026-09-18T09:50:49.514335Z" },
+        "2026-09-18T15:33:33Z",
+      )).toBe("2026-10-18T09:50:49.000Z");
+      expect(await monthlyResetAt(
+        { Plan: "free", CreatedAt: "2025-09-25T10:00:00Z" },
+        "2026-09-18T15:33:33Z",
+      )).toBe("2026-09-25T10:00:00.000Z");
+    });
 
-      const usage = await getUsageForProvider({
-        provider: "ollama",
-        apiKey: "k",
-        providerSpecificData: {},
-      });
-      expect(usage.quotas["Monthly"].resetAt).toBeNull();
+    it("clamps the anniversary day to shorter months", async () => {
+      expect(await monthlyResetAt(
+        { Plan: "free", CreatedAt: "2026-01-31T12:00:00Z" },
+        "2026-02-10T00:00:00Z",
+      )).toBe("2026-02-28T12:00:00.000Z");
     });
   });
 

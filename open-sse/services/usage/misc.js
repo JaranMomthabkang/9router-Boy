@@ -30,6 +30,33 @@ const OLLAMA_LIMIT_WINDOWS = {
   monthly: "Monthly",
 };
 
+// Ollama runs the session and weekly windows on a fixed global schedule — they
+// are not per-account rolling windows — and /api/usage reports only how much of
+// each is used, never when it ends (ollama/ollama#15660, #15663). Both are
+// derived here from the schedule and match the timestamp the settings page
+// itself renders for a real window:
+//   session — every 5h on the Unix-epoch grid. The grid lands on whole hours
+//             but drifts 4h/day (86400 % 18000 ≠ 0), so it is NOT midnight
+//             based; it is not per-account, because a rolling window would
+//             start at the first request. Sample: 2026-04-23T11:00:00Z.
+//   weekly  — Monday 00:00 UTC. Sample: 2026-04-27T00:00:00Z. Note that
+//             activity.period.starting_at is NOT this boundary — it marks a
+//             rolling last_4_weeks activity window and lands on any weekday.
+const OLLAMA_SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
+const OLLAMA_WEEKLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function nextOllamaSessionReset(now = new Date()) {
+  const nowMs = now.getTime();
+  const intoPeriod = ((nowMs % OLLAMA_SESSION_WINDOW_MS) + OLLAMA_SESSION_WINDOW_MS) % OLLAMA_SESSION_WINDOW_MS;
+  return new Date(nowMs + (OLLAMA_SESSION_WINDOW_MS - intoPeriod)).toISOString();
+}
+
+function nextOllamaWeeklyReset(now = new Date()) {
+  const dayOffset = (now.getUTCDay() + 6) % 7; // Monday = 0 … Sunday = 6
+  const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - dayOffset);
+  return new Date(start + OLLAMA_WEEKLY_WINDOW_MS).toISOString();
+}
+
 function addUtcMonths(date, months) {
   const total = date.getUTCMonth() + months;
   const year = date.getUTCFullYear() + Math.floor(total / 12);
@@ -41,9 +68,14 @@ function addUtcMonths(date, months) {
   ));
 }
 
-// Free plan: "usage resets monthly from the date you signed up" (ollama.com/pricing).
-function nextMonthlyResetFromSignup(createdAt, now = new Date()) {
-  const anchor = new Date(createdAt);
+// Monthly included usage resets on the anniversary of the billing period, in
+// UTC, clamping to a shorter month's last day and restoring the original day
+// afterwards: "usage resets monthly on the same day of the month your
+// subscription started" for paid plans, "monthly from the date you signed up"
+// on Free (ollama.com/pricing). Either date works as the anchor — a period end
+// that is already current is returned as-is, an older one rolls forward.
+function nextMonthlyReset(anchorDate, now = new Date()) {
+  const anchor = new Date(anchorDate);
   if (Number.isNaN(anchor.getTime())) return null;
   const elapsedMonths = (now.getUTCFullYear() - anchor.getUTCFullYear()) * 12
     + (now.getUTCMonth() - anchor.getUTCMonth());
@@ -54,13 +86,26 @@ function nextMonthlyResetFromSignup(createdAt, now = new Date()) {
   return null;
 }
 
+// /api/me is served by a Go struct, so SubscriptionPeriodEnd arrives as a
+// nullable-time object ({ Time, Valid }) — but tolerate a bare string too, in
+// case the field is ever serialised differently.
+function readMeDate(value) {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && value.Valid === true && typeof value.Time === "string") {
+    return value.Time;
+  }
+  return null;
+}
+
 /**
  * Ollama Cloud Usage
  * GET https://ollama.com/api/usage — `limits.<window>.usage` is a 0..1 ratio
  *   (1.0 = limit reached). Paid plans report session (5h) + weekly (7d); the
- *   free plan reports a single monthly window. No reset timestamp exposed;
- *   the free monthly reset is derived from the account's signup date.
- * POST https://ollama.com/api/me — plan label + CreatedAt (fail-open).
+ *   free plan reports a single monthly window. No reset timestamp exposed, so
+ *   session/weekly are derived from Ollama's fixed global window schedule and
+ *   monthly from the billing-period anchor on /api/me.
+ * POST https://ollama.com/api/me — plan label, CreatedAt, SubscriptionPeriodEnd
+ *   (fail-open).
  * Auth: Authorization: Bearer <apiKey>
  */
 export async function getOllamaUsage(apiKey, providerSpecificData, proxyOptions = null) {
@@ -116,9 +161,17 @@ export async function getOllamaUsage(apiKey, providerSpecificData, proxyOptions 
       return { used: usedPct, total: 100, remainingPercentage: 100 - usedPct, resetAt, unlimited: false };
     }
 
-    const monthlyResetAt = planRaw.toLowerCase() === "free" && me?.CreatedAt
-      ? nextMonthlyResetFromSignup(me.CreatedAt)
-      : null;
+    const now = new Date();
+    // Monthly needs an anchor Ollama does not put on /api/usage. Use the
+    // billing-period end when /api/me reports one; otherwise fall back to the
+    // signup date, which is the documented anniversary on Free and a good
+    // approximation on paid plans whose anniversary matches their signup day.
+    const monthlyAnchor = readMeDate(me?.SubscriptionPeriodEnd) || readMeDate(me?.CreatedAt);
+    const resetAtFor = {
+      session: () => nextOllamaSessionReset(now),
+      weekly: () => nextOllamaWeeklyReset(now),
+      monthly: (anchor) => (anchor ? nextMonthlyReset(anchor, now) : null),
+    };
 
     const quotas = {};
     for (const [key, label] of Object.entries(OLLAMA_LIMIT_WINDOWS)) {
@@ -126,7 +179,7 @@ export async function getOllamaUsage(apiKey, providerSpecificData, proxyOptions 
       if (raw === undefined || raw === null) continue;
       const ratio = Number(raw);
       if (Number.isNaN(ratio)) continue;
-      quotas[label] = ratioQuota(ratio, key === "monthly" ? monthlyResetAt : null);
+      quotas[label] = ratioQuota(ratio, resetAtFor[key](monthlyAnchor));
     }
 
     if (Object.keys(quotas).length === 0) {
