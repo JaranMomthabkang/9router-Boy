@@ -1,3 +1,11 @@
+# Unreleased
+
+## Fixes
+- **Antigravity**: switch the client fingerprint to `antigravity/hub/2.24.0` — the UA *scheme* gates the upstream catalog, and `antigravity/ide/*` gets the legacy 23-model list and 404s on Gemini 4 Argon; add `gemini-4-argon-high|medium|low` to the registry, quota tracking, and model-sync fallback (the sync only backfilled `gemini-3*`, so Argon never appeared in the dashboard)
+
+## Features
+- **Gemini 4 Argon**: level-based thinking that cannot be disabled, `low|medium|high` only (Argon rejects `thinkingLevel: "minimal"` and `thinkingBudget` with 400) — the gemini-level path clamps to the lowest supported level; 1M context, 64K output
+
 # v0.5.91 (2026-09-26)
 
 ## Features
