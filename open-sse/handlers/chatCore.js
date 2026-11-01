@@ -402,7 +402,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       model,
       body: translatedBody,
       stream,
-      credentials,
+      // Per-request view: runtimeTransport is set on the scoped copy, so handing the
+      // shared pool object here would drop it and every declared-transport route
+      // (kimi /responses, opencode-go, xiaomi) would silently fall back to the default.
+      credentials: requestCredentials || credentials,
       providerSessionId: sessionSeed,
       clientTool,
       signal: streamController.signal,
@@ -471,7 +474,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             model,
             body: translatedBody,
             stream,
-            credentials,
+            credentials: requestCredentials || credentials,
             providerSessionId: sessionSeed,
             clientTool,
             signal: streamController.signal,
