@@ -92,6 +92,9 @@ export const ANTHROPIC_COMPAT_BASE = "https://api.anthropic.com/v1";
 // Official Antigravity Hub Desktop 2.24.0 fingerprint captured from macOS arm64.
 // Keep this static even when 9router runs on Linux: the provider profile is
 // intentionally matching the Hub client, not the server host.
+// The UA scheme matters, not just the version: `antigravity/ide/<ver>` gets the
+// legacy 23-model catalog and 404s on Gemini 4 Argon, while `antigravity/hub/<ver>`
+// gets the 26-model catalog including gemini-4-argon-{high,medium,low}.
 export const ANTIGRAVITY_IDE_VERSION = "2.24.0";
 export const ANTIGRAVITY_IDE_BASE_URL = "https://daily-cloudcode-pa.googleapis.com";
 export const ANTIGRAVITY_IDE_USER_AGENT = `antigravity/hub/${ANTIGRAVITY_IDE_VERSION} darwin/arm64`;

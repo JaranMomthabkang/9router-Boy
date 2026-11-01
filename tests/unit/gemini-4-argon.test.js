@@ -2,9 +2,30 @@ import { describe, expect, it } from "vitest";
 
 import { getModelUpstreamId } from "../../open-sse/config/providerModels.js";
 import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
+import antigravity from "../../open-sse/providers/registry/antigravity.js";
 import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
 import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
+import { ANTIGRAVITY_IDE_USER_AGENT } from "../../open-sse/providers/shared.js";
 import { applyThinking, stripThinkingSuffix } from "../../open-sse/translator/concerns/thinkingUnified.js";
+
+describe("Antigravity client fingerprint", () => {
+  // Upstream gates the catalog AND serves models by UA scheme: `antigravity/ide/*`
+  // returns 23 legacy models and 404s on Gemini 4 Argon; `antigravity/hub/*` returns
+  // 26 including gemini-4-argon-{high,medium,low}.
+  it("uses the hub UA scheme so the Argon tiers are reachable", () => {
+    expect(ANTIGRAVITY_IDE_USER_AGENT).toBe("antigravity/hub/2.24.0 darwin/arm64");
+    expect(antigravity.transport.headers["User-Agent"]).toBe(ANTIGRAVITY_IDE_USER_AGENT);
+  });
+
+  it("registers all three Argon tiers ahead of the flash models", () => {
+    const ids = antigravity.models.map((m) => m.id);
+    expect(ids.slice(0, 3)).toEqual([
+      "gemini-4-argon-high",
+      "gemini-4-argon-medium",
+      "gemini-4-argon-low",
+    ]);
+  });
+});
 
 describe("Gemini 4 Argon capabilities", () => {
   it.each(["gemini", "vertex", "antigravity"])("declares level-based always-on reasoning on %s", (provider) => {
@@ -44,6 +65,25 @@ describe("Gemini 4 Argon thinking clamp", () => {
     const body = { reasoning_effort: "none" };
     applyThinking("gemini", "gemini-3.8-flash", body, "gemini");
     expect(body.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "minimal", includeThoughts: false });
+  });
+
+  // Same clamp on the Antigravity wire, whose envelope nests generationConfig under request.
+  const agBody = (extra = {}) => ({
+    model: "gemini-4-argon-high",
+    request: { contents: [{ role: "user", parts: [{ text: "hello" }] }] },
+    ...extra,
+  });
+
+  it("clamps a none effort to low on the Antigravity envelope", () => {
+    const body = agBody({ reasoning_effort: "none" });
+    applyThinking("antigravity", "gemini-4-argon-high", body, "antigravity");
+    expect(body.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "low", includeThoughts: true });
+  });
+
+  it("passes a supported level through on the Antigravity envelope", () => {
+    const body = agBody({ reasoning_effort: "high" });
+    applyThinking("antigravity", "gemini-4-argon-high", body, "antigravity");
+    expect(body.request.generationConfig.thinkingConfig.thinkingLevel).toBe("high");
   });
 });
 

@@ -314,7 +314,7 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display, model = "")
     }
     case "gemini-level": {
       let level = none ? "minimal" : toGeminiThinkingLevel(eff);
-      // Models without a "minimal" tier (Gemini 4) reject it with 400 — clamp to the lowest supported level.
+      // Models without a "minimal" tier (Gemini 4 / Argon) reject it with 400 — clamp to the lowest supported level.
       const lowest = supportedLevels?.find((l) => l !== "none");
       if (supportedLevels?.length && lowest && !supportedLevels.includes(level)) level = lowest;
       setGeminiThinking(body, { thinkingLevel: level, includeThoughts: level !== "minimal" });

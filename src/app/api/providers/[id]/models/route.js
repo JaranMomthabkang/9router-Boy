@@ -915,8 +915,11 @@ export async function GET(request, { params }) {
       const projectId = connection.projectId || connection.providerSpecificData?.projectId;
       const body = projectId ? { project: projectId } : {};
 
+      // Registry UA, not a literal: upstream gates the catalog by UA scheme —
+      // `antigravity/1.x` gets the legacy 20-model list without the Argon tiers,
+      // `antigravity/hub/2.x` gets 26 including gemini-4-argon-{high,medium,low}.
       const userAgent = connection.provider === "antigravity"
-        ? "antigravity/1.107.0 darwin/arm64"
+        ? (PROVIDERS.antigravity?.transport?.headers?.["User-Agent"] || "antigravity/hub/2.24.0 darwin/arm64")
         : "google-api-nodejs-client/9.15.1";
       const clientId = connection.provider === "antigravity"
         ? ANTIGRAVITY_CONFIG.clientId
@@ -982,7 +985,8 @@ export async function GET(request, { params }) {
           if (connection.provider === "antigravity" && PROVIDERS.antigravity?.models) {
             const seen = new Set(models.map((m) => m.id));
             for (const staticModel of PROVIDERS.antigravity.models) {
-              if (/gemini-3/i.test(staticModel.id) && !seen.has(staticModel.id)) {
+              // Any Gemini generation the live catalog omitted (e.g. gemini-4-argon-*).
+              if (/gemini-\d/i.test(staticModel.id) && !seen.has(staticModel.id)) {
                 seen.add(staticModel.id);
                 models.push({
                   ...staticModel,
